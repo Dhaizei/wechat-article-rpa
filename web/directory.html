@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="按公众号浏览已采集内容、最近发布和文章动态。" />
+    <title>公众号目录 · 团队资讯日报</title>
+    <link rel="stylesheet" href="/directory.css?v=20260803-directory" />
+  </head>
+  <body>
+    <main class="directory-shell">
+      <header class="directory-topbar">
+        <a class="directory-brand" href="/briefing.html" aria-label="每日新闻首页"><span aria-hidden="true">▣</span> 团队资讯日报<small>公众号智能助手</small></a>
+        <nav class="directory-nav" aria-label="团队阅读导航">
+          <a href="/briefing.html">每日新闻</a>
+          <a href="/daily.html">文章动态</a>
+          <a class="active" aria-current="page" href="/directory.html">公众号目录</a>
+        </nav>
+      </header>
+
+      <section class="directory-page-head">
+        <div><p class="directory-kicker">采集对象</p><h1>公众号目录</h1><p>按公众号组织文章与最新动态，快速进入某一来源的内容流。</p></div>
+        <dl class="directory-stats" aria-label="公众号概览">
+          <div><dt>公众号总数</dt><dd id="totalAccounts">—</dd></div>
+          <div><dt>已入库</dt><dd id="coveredAccounts">—</dd></div>
+          <div><dt>待核对</dt><dd id="missingAccounts">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="directory-tools" aria-label="公众号目录筛选">
+        <label for="accountQuery">查找公众号<input id="accountQuery" placeholder="输入公众号名称或采集搜索名" /></label>
+        <nav id="categoryTabs" aria-label="按分类筛选"></nav>
+      </section>
+
+      <section class="directory-layout">
+        <section class="directory-list" aria-labelledby="directoryListTitle">
+          <header><div><h2 id="directoryListTitle">公众号列表</h2><p id="directorySummary">正在读取账号目录…</p></div><button id="previousPage" type="button">上一页</button><button id="nextPage" type="button">下一页</button></header>
+          <div class="directory-table-wrap"><table><thead><tr><th>公众号</th><th>分类</th><th>最近发布</th><th>入库文章</th><th>采集状态</th></tr></thead><tbody id="directoryRows"></tbody></table></div>
+        </section>
+        <aside class="account-preview" aria-labelledby="previewTitle">
+          <div id="accountPreview"><p class="directory-empty">选择左侧公众号，查看最近文章。</p></div>
+        </aside>
+      </section>
+      <footer>目录数据来自采集账号配置与文章库 · 仅供团队浏览</footer>
+    </main>
+    <div class="directory-toast" id="directoryToast" role="status"></div>
+    <script src="/directory.js?v=20260803-directory"></script>
+  </body>
+</html>

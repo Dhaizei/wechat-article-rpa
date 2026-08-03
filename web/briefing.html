@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="团队每日新闻：阅读编辑后的公众号资讯摘要，并查看准确的汇总范围。" />
+    <title>每日新闻 · 团队资讯日报</title>
+    <link rel="stylesheet" href="/briefing.css?v=20260803-briefing" />
+  </head>
+  <body>
+    <main class="briefing-shell">
+      <header class="briefing-topbar">
+        <a class="briefing-brand" href="/briefing.html" aria-label="每日新闻首页"><span aria-hidden="true">▣</span> 团队资讯日报<small>公众号智能助手</small></a>
+        <nav class="briefing-nav" aria-label="团队阅读导航">
+          <a class="active" aria-current="page" href="/briefing.html">每日新闻</a>
+          <a href="/daily.html">文章动态</a>
+          <a href="/directory.html">公众号目录</a>
+        </nav>
+      </header>
+
+      <section class="briefing-layout">
+        <aside class="issue-archive" aria-labelledby="archiveTitle">
+          <!-- 让归档侧栏的 aria-labelledby 指向真实标题，键盘与读屏用户可快速理解区域用途。 -->
+          <div class="archive-head"><p id="archiveTitle">日报档案</p><span id="archiveCount" class="archive-count">—</span></div>
+          <div id="issueArchive" class="archive-list" aria-live="polite"></div>
+        </aside>
+
+        <section class="briefing-main" aria-labelledby="briefingTitle">
+          <header class="briefing-head">
+            <div>
+              <p class="briefing-kicker">每日新闻</p>
+              <h1 id="briefingTitle">正在读取早报…</h1>
+              <p id="briefingMeta" class="briefing-meta"></p>
+            </div>
+            <div class="issue-control" aria-label="选择日报期次">
+              <button id="previousIssue" type="button" aria-label="上一期">‹</button>
+              <input id="issueDate" type="date" aria-label="日报生成日期" />
+              <button id="nextIssue" type="button" aria-label="下一期">›</button>
+            </div>
+          </header>
+
+          <section id="briefingContent" class="briefing-content" aria-live="polite"></section>
+        </section>
+
+        <aside class="briefing-aside">
+          <section class="coverage-panel" aria-labelledby="coverageTitle">
+            <h2 id="coverageTitle">数据范围</h2>
+            <dl id="coverageList"></dl>
+            <a id="openCoverageArticles" class="coverage-link" href="/daily.html">查看原始文章</a>
+          </section>
+          <section class="highlight-panel" aria-labelledby="highlightTitle">
+            <h2 id="highlightTitle">本期热点</h2>
+            <ol id="briefingHighlights"></ol>
+          </section>
+        </aside>
+      </section>
+      <footer class="briefing-footer">编辑日报来自 daily_news_send · 资讯范围以页面所示时间为准</footer>
+    </main>
+    <div class="briefing-toast" id="briefingToast" role="status"></div>
+    <script src="/briefing.js?v=20260803-briefing"></script>
+  </body>
+</html>

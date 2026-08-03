@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>公众号采集控制台</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>公众号采集控制台</h1>
+          <p>统一配置采集范围，按需手动执行或保存为定时计划。</p>
+        </div>
+        <div class="service-state" id="serviceState">
+          <span class="state-dot"></span>
+          <span>控制台连接中</span>
+        </div>
+      </header>
+      <nav class="product-nav" aria-label="主导航">
+        <a class="active" aria-current="page" href="/">控制台</a>
+        <a href="/daily.html">团队日报</a>
+        <a href="/accounts.html">公众号管理</a>
+        <a href="/articles.html">文章管理</a>
+      </nav>
+
+      <section class="preflight-panel" aria-labelledby="preflightTitle">
+        <div class="preflight-heading">
+          <div>
+            <h2 id="preflightTitle">启动前准备</h2>
+            <p id="preflightSummary">正在检查微信运行环境…</p>
+          </div>
+          <button class="text-button" id="refreshPreflight" type="button">重新检测并尝试打开</button>
+        </div>
+        <div class="preflight-checks">
+          <div class="preflight-item" id="wechatCheck">
+            <span class="check-icon">?</span>
+            <div><strong>微信已登录</strong><small>正在检测</small></div>
+          </div>
+          <div class="preflight-item" id="searchCheck">
+            <span class="check-icon">?</span>
+            <div><strong>“搜一搜”已打开</strong><small>正在检测</small></div>
+          </div>
+        </div>
+        <details class="automation-guide">
+          <summary>采集过程中会自动处理什么？</summary>
+          <div class="automation-guide-content">
+            <p><strong>窗口自动管理</strong>：公众号资料窗口和文章窗口会按顺序打开、校验并关闭，无需手工排列。</p>
+            <p id="desktopCheck"><strong>屏幕与缩放适配</strong>：正在读取当前分辨率和缩放比例。</p>
+          </div>
+        </details>
+        <p class="preflight-guide">点击“重新检测并尝试打开”后，控制台会自动在已登录微信中搜索并打开“搜一搜”；若微信未登录或正在采集，则会提示你下一步操作。</p>
+      </section>
+
+      <section class="control-panel" aria-labelledby="controlTitle">
+        <div class="section-heading">
+          <span class="heading-mark"></span>
+          <div>
+            <h2 id="controlTitle">采集配置</h2>
+            <p>手动执行严格使用这里的当前选择；定时任务只使用你点击“保存计划”时写入的参数。</p>
+          </div>
+        </div>
+        <div class="config-grid">
+          <div class="source-field">
+            <span>账号来源</span>
+            <strong>MongoDB 账号列表</strong>
+          </div>
+          <label>
+            <span>扫描范围</span>
+            <select id="scanRange">
+              <option value="today_yesterday">今天和昨天</option>
+              <option value="today">今天</option>
+              <option value="yesterday">昨天</option>
+            </select>
+          </label>
+          <label>
+            <span>采集指标</span>
+            <select id="metrics">
+              <option value="share">仅转发数（速度更快）</option>
+              <option value="all">全部互动数</option>
+            </select>
+          </label>
+          <label>
+            <span>每账号文章上限</span>
+            <input id="maxArticles" type="number" min="1" max="100" value="20" />
+          </label>
+        </div>
+        <div class="config-preview" id="currentConfigPreview">本次运行：正在读取配置…</div>
+      </section>
+
+      <section class="progress-panel" aria-labelledby="progressTitle">
+        <div class="progress-heading">
+          <div>
+            <h2 id="progressTitle">采集进度</h2>
+            <p>任务启动后会根据 RPA 日志实时更新，不会额外干扰微信采集。</p>
+          </div>
+          <strong class="progress-state" id="progressState">等待任务</strong>
+        </div>
+        <div class="progress-table-wrap">
+          <table class="progress-table">
+            <thead>
+              <tr><th>公众号进度</th><th>当前公众号</th><th>本账号文章</th><th>累计文章</th><th>当前阶段</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td id="accountPosition">等待读取</td>
+                <td id="currentAccount">—</td>
+                <td id="currentAccountArticles">0 篇</td>
+                <td id="totalArticles">0 篇</td>
+                <td id="progressPhase">等待任务</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="overall-progress-track" aria-label="公众号采集总进度" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="overallProgressBar"></span></div>
+      </section>
+
+      <section class="run-history-panel" aria-labelledby="runHistoryTitle">
+        <div class="run-history-heading">
+          <div>
+            <h2 id="runHistoryTitle">任务结果</h2>
+            <p id="runSummaryText">尚无已保存的采集任务。</p>
+          </div>
+          <span class="run-id" id="activeRunId">当前未运行</span>
+        </div>
+        <div class="run-history-table-wrap">
+          <table class="run-history-table">
+            <thead>
+              <tr><th>开始时间</th><th>来源</th><th>实际参数</th><th>结果摘要</th><th>状态</th></tr>
+            </thead>
+            <tbody id="runHistoryBody">
+              <tr><td colspan="5" class="empty-cell">正在读取任务历史…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="run-diagnostic" id="runDiagnostic" hidden>
+          <strong id="runDiagnosticTitle">任务诊断</strong>
+          <div id="runDiagnosticBody"></div>
+        </div>
+      </section>
+
+      <section class="action-layout" aria-label="任务操作">
+        <article class="action-panel manual-panel">
+          <div class="action-label">手动执行</div>
+          <h2>立即采集一次</h2>
+          <p>严格按上方当前配置启动，不会读取或覆盖为定时计划参数。</p>
+          <div class="button-row">
+            <button class="button primary" id="startManual">立即开始</button>
+            <button class="button secondary danger" id="stopTask" disabled>停止任务</button>
+          </div>
+          <div class="run-state">
+            <div class="run-state-line">
+              <span>当前状态</span>
+              <strong id="currentState">空闲</strong>
+            </div>
+            <div class="progress-track"><span id="progressBar"></span></div>
+            <p id="currentDetail">确认微信已登录，并保持“搜一搜”窗口可见。</p>
+          </div>
+        </article>
+
+        <article class="action-panel schedule-panel">
+          <div class="schedule-head">
+            <div>
+              <div class="action-label">定时任务</div>
+              <h2>保存为每日计划</h2>
+            </div>
+            <label class="switch-control">
+              <input id="scheduleEnabled" type="checkbox" />
+              <span class="switch"></span>
+              <span id="scheduleEnabledText">未启用</span>
+            </label>
+          </div>
+          <label class="schedule-time-field">
+            <span>每日执行时间</span>
+            <input id="scheduleTimes" type="text" value="08:00, 22:00" placeholder="08:00, 22:00" />
+            <small>使用逗号分隔，最多设置 8 个时间。</small>
+          </label>
+          <div class="schedule-range-list" id="scheduleRangeList" aria-label="各时段扫描范围"></div>
+          <div class="schedule-preview" id="savedSchedulePreview">已保存计划参数：正在读取…</div>
+          <div class="button-row">
+            <button class="button primary" id="saveSchedule">保存计划</button>
+            <button class="button secondary" id="testSchedule">按已保存计划测试</button>
+          </div>
+          <div class="next-run"><span>下次执行</span><strong id="nextRun">未启用</strong></div>
+        </article>
+      </section>
+
+      <section class="log-panel">
+        <div class="log-header">
+          <div>
+            <h2>运行日志</h2>
+            <p id="outputPath">尚未创建输出目录</p>
+          </div>
+          <div class="log-summary">
+            <span><b class="dot info"></b>信息 <strong id="infoCount">0</strong></span>
+            <span><b class="dot success"></b>成功 <strong id="successCount">0</strong></span>
+            <span><b class="dot warning"></b>警告 <strong id="warningCount">0</strong></span>
+            <span><b class="dot error"></b>错误 <strong id="errorCount">0</strong></span>
+            <button class="text-button" id="clearLogs">清空显示</button>
+          </div>
+        </div>
+        <div class="log-console" id="logConsole" aria-live="polite"></div>
+      </section>
+    </main>
+    <div class="confirm-backdrop" id="runConfirmDialog" hidden>
+      <section class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirmRunTitle">
+        <div class="action-label">启动确认</div>
+        <h2 id="confirmRunTitle">确认开始采集？</h2>
+        <p id="confirmRunDescription">正在准备本次任务信息…</p>
+        <div class="confirm-facts" id="confirmRunFacts"></div>
+        <p class="confirm-warning">开始后会占用微信、鼠标和键盘。运行期间请勿切换窗口或手动操作微信。</p>
+        <div class="button-row">
+          <button class="button secondary" id="cancelRunConfirm" type="button">返回检查</button>
+          <button class="button primary" id="confirmRunStart" type="button">确认并开始</button>
+        </div>
+      </section>
+    </div>
+    <div class="toast" id="toast" role="status"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

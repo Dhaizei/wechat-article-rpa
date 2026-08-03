@@ -1,0 +1,10 @@
+Pillow>=11.0,<13
+requests>=2.32,<3
+beautifulsoup4>=4.13,<5
+pymongo>=4.10,<5
+numpy==1.26.4
+opencv-python==4.10.0.84
+onnxruntime==1.20.1
+rapidocr-onnxruntime==1.4.4
+pyperclip>=1.9,<2
+tzdata>=2024.1

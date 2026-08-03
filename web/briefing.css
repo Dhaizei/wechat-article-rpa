@@ -1,0 +1,74 @@
+:root { --ink: #15213a; --blue: #2165d7; --blue-soft: #edf4ff; --line: #e3eaf4; --muted: #718099; --page: #f6f8fc; --paper: #fff; }
+* { box-sizing: border-box; } body { min-width: 320px; min-height: 100vh; margin: 0; color: var(--ink); background: var(--page); font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif; } button, input { font: inherit; } button:focus-visible, input:focus-visible, a:focus-visible { outline: 3px solid rgba(33, 101, 215, .24); outline-offset: 2px; }
+.briefing-shell { min-height: 100vh; }.briefing-topbar { display: grid; grid-template-columns: minmax(230px, 1fr) auto minmax(100px, 1fr); align-items: center; min-height: 82px; padding: 0 42px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.94); }.briefing-brand { position: relative; display: inline-flex; align-items: center; width: fit-content; padding-left: 42px; color: var(--ink); font-size: 20px; font-weight: 850; letter-spacing: -.03em; text-decoration: none; }.briefing-brand span { position: absolute; left: 0; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 7px; color: white; background: var(--blue); font-size: 18px; }.briefing-brand small { position: absolute; top: 25px; left: 42px; color: #8290a6; font-size: 11px; font-weight: 600; letter-spacing: 0; white-space: nowrap; }.briefing-nav { display: flex; gap: 42px; align-self: stretch; }.briefing-nav a { display: grid; align-items: center; border-bottom: 3px solid transparent; color: #5a6980; font-size: 15px; font-weight: 750; text-decoration: none; }.briefing-nav a:hover, .briefing-nav a.active { border-bottom-color: var(--blue); color: var(--blue); }.briefing-admin { justify-self: end; color: #52647c; font-size: 14px; font-weight: 700; text-decoration: none; }.briefing-admin:hover { color: var(--blue); }
+.briefing-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr) 270px; gap: 24px; width: min(1440px, calc(100% - 56px)); margin: 26px auto; }.issue-archive, .briefing-main, .coverage-panel, .highlight-panel { border: 1px solid var(--line); border-radius: 10px; background: var(--paper); box-shadow: 0 12px 30px rgba(24, 46, 78, .04); }.issue-archive { position: sticky; top: 18px; align-self: start; max-height: calc(100vh - 36px); overflow-y: auto; padding: 22px 16px; scrollbar-gutter: stable; }.archive-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 0 7px 13px; border-bottom: 1px solid var(--line); }.archive-head p { margin: 0; font-size: 16px; font-weight: 800; }.archive-head span { color: var(--muted); font-size: 11px; }.archive-list { display: grid; gap: 5px; margin-top: 12px; }.archive-item { width: 100%; padding: 14px 12px; border: 1px solid transparent; border-radius: 7px; cursor: pointer; color: #50627c; background: transparent; text-align: left; }.archive-item:hover { background: #f7faff; }.archive-item.active { border-color: #a8c6fa; color: #1d58bd; background: var(--blue-soft); }.archive-item strong, .archive-item small { display: block; }.archive-item strong { font-size: 14px; }.archive-item small { overflow: hidden; margin-top: 5px; color: #7d8ba0; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.briefing-main { min-width: 0; padding: 34px 42px; }.briefing-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding-bottom: 25px; border-bottom: 1px solid var(--line); }.briefing-kicker { margin: 0 0 7px; color: var(--blue); font-size: 13px; font-weight: 800; }.briefing-head h1 { margin: 0; font-size: clamp(28px, 3vw, 40px); letter-spacing: -.045em; }.briefing-meta { margin: 12px 0 0; color: #6e7e95; font-size: 13px; }.issue-control { display: flex; align-items: center; gap: 6px; padding-top: 5px; }.issue-control button { width: 36px; height: 36px; border: 1px solid var(--line); border-radius: 7px; cursor: pointer; color: #3f5575; background: #fff; font-size: 25px; line-height: 1; }.issue-control button:hover { border-color: #a7c6f6; color: var(--blue); background: #f5f9ff; }.issue-control input { width: 132px; border: 0; color: #3f506a; background: transparent; font-size: 13px; font-weight: 750; text-align: center; }
+.briefing-content { min-height: 500px; padding-top: 25px; }.briefing-executive { display: grid; gap: 14px; }.briefing-section-label { margin: 0; color: var(--blue); font-size: 13px; font-weight: 800; }.briefing-headline-card { padding: 24px 25px; border: 1px solid #d7e5fb; border-radius: 10px; background: linear-gradient(135deg, #f7fbff 0%, #eef5ff 100%); }.briefing-headline-card h2, .briefing-report h2 { margin: 0 0 10px; color: #1e579f; font-size: 19px; }.briefing-headline-card h2::before { content: "01"; display: inline-grid; place-items: center; width: 25px; height: 25px; margin-right: 9px; border-radius: 7px; color: #fff; background: var(--blue); font-size: 11px; vertical-align: 2px; }.briefing-headline-card p { max-width: 860px; margin: 0; color: #334967; font-size: 16px; font-weight: 650; line-height: 1.85; }.briefing-insight-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }.briefing-insight-card { min-width: 0; padding: 19px 21px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }.briefing-insight-card.focus { border-top: 3px solid #4e83e5; }.briefing-insight-card.strategy { border-top: 3px solid #18a67b; }.briefing-insight-card h3 { margin: 0 0 10px; color: #253b5d; font-size: 15px; }.briefing-insight-card h3::before { display: inline-block; margin-right: 7px; color: var(--blue); content: "●"; font-size: 10px; vertical-align: 1px; }.briefing-insight-card.strategy h3::before { color: #18a67b; }.briefing-insight-card ul { display: grid; gap: 9px; margin: 0; padding: 0; list-style: none; }.briefing-insight-card li { position: relative; padding-left: 13px; color: #52647c; font-size: 13px; line-height: 1.7; }.briefing-insight-card li::before { position: absolute; left: 0; color: #88a0c4; content: "·"; font-size: 19px; line-height: .95; }.briefing-report { margin-top: 32px; padding-top: 27px; border-top: 1px solid var(--line); }.briefing-report-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }.briefing-report-head span { color: var(--muted); font-size: 12px; }.briefing-full-report { margin-top: 14px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }.briefing-full-report > summary { display: flex; align-items: center; min-height: 50px; padding: 0 18px; cursor: pointer; color: #245dbd; font-size: 14px; font-weight: 750; list-style: none; }.briefing-full-report > summary::-webkit-details-marker { display: none; }.briefing-full-report > summary::after { margin-left: auto; color: #6b88b9; content: "⌄"; font-size: 18px; transition: transform .16s ease; }.briefing-full-report[open] > summary { border-bottom: 1px solid var(--line); }.briefing-full-report[open] > summary::after { transform: rotate(180deg); }.briefing-report-sections { display: grid; gap: 18px; padding: 20px; }.briefing-category { padding: 18px; border-radius: 8px; background: #f8faff; }.briefing-category > h3 { margin: 0 0 14px; color: #244c83; font-size: 16px; }.briefing-report-article { padding: 14px 0; border-top: 1px solid #e5ebf3; }.briefing-report-article:first-of-type { border-top: 0; }.briefing-report-article h4 { margin: 0 0 8px; color: #293d5e; font-size: 14px; line-height: 1.6; }.briefing-category p, .briefing-report-article p { margin: 7px 0 0; color: #5c6d83; font-size: 13px; line-height: 1.75; }.briefing-reference { color: #4d77b6 !important; }.briefing-reference a { color: #2165d7; font-weight: 700; text-decoration: none; }.briefing-reference a:hover { text-decoration: underline; }.briefing-empty { padding: 72px 14px; color: var(--muted); font-size: 15px; line-height: 1.75; text-align: center; }.briefing-empty a { color: var(--blue); font-weight: 750; }
+.briefing-aside { display: grid; align-content: start; gap: 16px; }.coverage-panel, .highlight-panel { padding: 22px 21px; }.coverage-panel h2, .highlight-panel h2 { margin: 0; font-size: 17px; }.coverage-panel dl { display: grid; gap: 0; margin: 16px 0 19px; }.coverage-panel dl div { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--line); }.coverage-panel dt { color: #6e7f96; font-size: 13px; }.coverage-panel dd { margin: 0; color: #354863; font-size: 13px; font-weight: 700; text-align: right; }.coverage-link { display: block; padding: 12px; border-radius: 7px; color: #fff; background: var(--blue); font-size: 14px; font-weight: 750; text-align: center; text-decoration: none; }.coverage-link:hover { background: #1556bf; }.highlight-panel ol { display: grid; gap: 13px; margin: 17px 0 0; padding: 0; list-style-position: inside; }.highlight-panel li { padding-bottom: 12px; border-bottom: 1px solid var(--line); color: #33465f; font-size: 13px; line-height: 1.45; }.highlight-panel li:last-child { border-bottom: 0; }.highlight-panel a { color: inherit; font-weight: 700; text-decoration: none; }.highlight-panel a:hover { color: var(--blue); text-decoration: underline; }.highlight-panel small { display: block; margin: 4px 0 0 21px; color: #8593a8; font-size: 11px; }.briefing-footer { width: min(1440px, calc(100% - 56px)); margin: 0 auto 26px; color: #8492a7; font-size: 12px; }.briefing-toast { position: fixed; right: 24px; bottom: 24px; max-width: 360px; padding: 12px 16px; border-radius: 8px; color: #fff; background: #17243a; opacity: 0; pointer-events: none; transform: translateY(10px); transition: .18s ease; }.briefing-toast.show { opacity: 1; transform: translateY(0); }
+@media (max-width: 1100px) { .briefing-topbar { grid-template-columns: 1fr auto; gap: 14px; padding: 16px 24px; }.briefing-nav { order: 3; grid-column: 1 / -1; gap: 28px; min-height: 34px; }.briefing-nav a { padding-bottom: 10px; }.briefing-layout { grid-template-columns: minmax(0, 1fr) 270px; }.issue-archive { position: static; grid-column: 1 / -1; max-height: none; }.archive-list { grid-template-columns: repeat(auto-fill, minmax(185px, 1fr)); }.briefing-main { grid-column: 1; }.briefing-aside { grid-column: 2; } }
+@media (max-width: 760px) { .briefing-topbar { grid-template-columns: 1fr; }.briefing-admin { display: none; }.briefing-nav { width: 100%; overflow-x: auto; gap: 24px; }.briefing-layout { grid-template-columns: 1fr; width: 100%; margin: 0; }.issue-archive, .briefing-main, .coverage-panel, .highlight-panel { border-radius: 0; box-shadow: none; }.issue-archive { position: static; max-height: none; padding: 18px; }.briefing-main { padding: 26px 20px; }.briefing-aside { grid-column: 1; gap: 0; }.coverage-panel, .highlight-panel { border-right: 0; border-left: 0; }.briefing-head { flex-direction: column; }.briefing-insight-grid { grid-template-columns: 1fr; }.briefing-report-head { align-items: flex-start; flex-direction: column; }.briefing-footer { width: 100%; padding: 18px; margin: 0; } }
+
+/* 桌面端让期次标题固定在卡片内，只有列表区域滚动，避免长列表遮挡归档入口。 */
+@media (min-width: 1101px) {
+  .issue-archive {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .archive-head { flex: 0 0 auto; }
+
+  .archive-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    padding-right: 4px;
+    scrollbar-gutter: stable;
+  }
+
+  /* 归档期次较多时，使用清晰、持续可见的纵向滚动条，而不是把内容截在卡片外。 */
+  .archive-list::-webkit-scrollbar { width: 9px; }
+  .archive-list::-webkit-scrollbar-track { background: #f1f5fb; border-radius: 999px; }
+  .archive-list::-webkit-scrollbar-thumb { border: 2px solid #f1f5fb; border-radius: 999px; background: #9fb8df; }
+  .archive-list::-webkit-scrollbar-thumb:hover { background: #6c91ca; }
+}
+
+/* 日报档案采用日期导航的紧凑列表；完整汇总范围只在当前日报正文与数据范围中展示。 */
+.archive-head { align-items: center; }
+.archive-head p { white-space: nowrap; }
+.archive-count { display: inline-flex; align-items: center; min-height: 24px; padding: 0 8px; border-radius: 999px; color: #1d58bd !important; background: #edf4ff; font-size: 12px !important; font-weight: 800; white-space: nowrap; }
+.archive-list { gap: 16px; margin-top: 14px; }
+.archive-month { min-width: 0; }
+.archive-month > h2 { display: flex; align-items: center; justify-content: space-between; margin: 0 0 5px; padding: 0 8px; color: #536682; font-size: 12px; font-weight: 800; }
+.archive-month > h2 span { color: #98a6ba; font-size: 11px; font-weight: 700; }
+.archive-month-list { display: grid; gap: 2px; }
+.archive-item { display: flex; align-items: center; justify-content: space-between; min-height: 38px; padding: 8px 10px; border-radius: 6px; }
+.archive-item strong, .archive-item small { display: inline; margin: 0; white-space: nowrap; }
+.archive-item strong { font-size: 13px; }
+.archive-item small { overflow: visible; color: #98a6ba; font-size: 11px; text-overflow: clip; }
+.archive-item.active small { color: #3775d5; }
+
+@media (max-width: 1100px) {
+  .archive-list { gap: 12px; }
+}
+
+/* 摘要只提供真实可核验的本期文章入口，不伪造“某个观点对应唯一原文”的关系。 */
+.briefing-source-strip { display: grid; gap: 10px; padding: 15px 17px; border: 1px solid #dfe8f4; border-radius: 10px; background: #fbfdff; }
+.briefing-source-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.briefing-source-head h3 { margin: 0; color: #27476f; font-size: 14px; }
+.briefing-source-head h3::before { display: inline-block; width: 18px; height: 18px; margin-right: 7px; border-radius: 5px; color: #fff; background: #4d82df; content: "↗"; font-size: 12px; line-height: 18px; text-align: center; }
+.briefing-source-head p { margin: 0; color: #8190a5; font-size: 11px; }
+.briefing-source-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.briefing-source-list a { display: grid; gap: 5px; min-width: 0; padding: 10px 11px; border: 1px solid #e2eaf5; border-radius: 7px; color: #344a68; background: #fff; text-decoration: none; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
+.briefing-source-list a:hover { border-color: #9fc0f3; background: #f4f8ff; transform: translateY(-1px); }
+.briefing-source-list strong { overflow: hidden; color: #2d4565; font-size: 12px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.briefing-source-list small { overflow: hidden; color: #8291a6; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.briefing-source-more { width: fit-content; color: #2a68c5; font-size: 12px; font-weight: 750; text-decoration: none; }
+.briefing-source-more:hover { color: #1455b4; text-decoration: underline; }
+
+@media (max-width: 760px) {
+  .briefing-source-list { grid-template-columns: 1fr; }
+  .briefing-source-head { align-items: flex-start; flex-direction: column; gap: 4px; }
+}

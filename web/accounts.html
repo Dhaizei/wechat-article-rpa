@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>公众号管理 · 公众号采集</title>
+    <link rel="stylesheet" href="/app.css?v=20260802-account-ui" />
+    <link rel="stylesheet" href="/accounts.css?v=20260802-account-ui" />
+  </head>
+  <body>
+    <main class="app-shell account-shell">
+      <header class="topbar">
+        <div>
+          <h1>公众号管理</h1>
+          <p>管理采集对象，查看文章入库情况，并安全维护搜索名称与账号配置。</p>
+        </div>
+        <a class="back-link" href="/">返回控制台</a>
+      </header>
+      <nav class="product-nav" aria-label="主导航">
+        <a href="/">控制台</a>
+        <a href="/daily.html">团队日报</a>
+        <a class="active" aria-current="page" href="/accounts.html">公众号管理</a>
+        <a href="/articles.html">文章管理</a>
+      </nav>
+
+      <section class="account-overview" aria-label="账号概览和快捷筛选">
+        <button class="overview-card is-active" type="button" data-account-status="all" aria-pressed="true">
+          <span>全部账号</span><strong id="totalAccounts">—</strong><small>采集配置总数</small>
+        </button>
+        <button class="overview-card warning" type="button" data-account-status="missing" aria-pressed="false">
+          <span>待补齐</span><strong id="missingAccounts">—</strong><small>尚未发现入库文章</small>
+        </button>
+        <button class="overview-card success" type="button" data-account-status="alias" aria-pressed="false">
+          <span>搜索别名</span><strong id="aliasAccounts">—</strong><small>使用单独搜索名称</small>
+        </button>
+        <p class="overview-note">文章数据只读；这里仅维护采集账号配置与本地搜索别名。</p>
+      </section>
+
+      <section class="account-toolbar" aria-label="公众号筛选">
+        <label class="query-field" for="accountQuery"><span>查找公众号</span><input id="accountQuery" placeholder="按公众号或搜索名称查找" /></label>
+        <label class="select-field" for="categoryFilter"><span>分类</span><select id="categoryFilter"><option value="">全部分类</option></select></label>
+        <label class="select-field" for="statusFilter"><span>入库状态</span><select id="statusFilter"><option value="all">全部状态</option><option value="covered">已入库</option><option value="missing">尚未入库</option><option value="alias">使用搜索别名</option></select></label>
+        <button class="button primary" id="searchAccounts" type="button">查询</button>
+      </section>
+
+      <section class="account-alert" id="missingAlert" hidden aria-live="polite">
+        <span class="alert-mark" aria-hidden="true">!</span>
+        <p>有 <strong id="missingAlertCount">0</strong> 个公众号尚未发现入库文章。请优先核对账号名称，或在下一次采集中补齐。</p>
+        <button class="text-button" id="showMissingAccounts" type="button">只看未入库</button>
+      </section>
+
+      <section class="account-results" aria-labelledby="accountResultTitle">
+        <div class="account-results-head">
+          <div><h2 id="accountResultTitle">账号列表</h2><p id="accountResultSummary">正在读取账号清单…</p></div>
+          <div class="account-result-actions">
+            <button class="text-button" id="exportAccounts" type="button">导出配置</button>
+            <button class="text-button" id="importAccounts" type="button">导入配置</button>
+            <button class="button primary compact-button" id="createAccount" type="button">添加公众号</button>
+          </div>
+        </div>
+        <div class="account-table-wrap">
+          <table class="account-table">
+            <thead><tr><th>公众号</th><th>分类</th><th>采集搜索名</th><th>入库文章</th><th>最近发布</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="accountList"></tbody>
+          </table>
+        </div>
+        <div class="article-pagination"><button class="text-button" id="previousPage" type="button">上一页</button><span id="pageText">第 1 页</span><button class="text-button" id="nextPage" type="button">下一页</button></div>
+      </section>
+    </main>
+
+    <dialog class="account-dialog" id="accountEditor">
+      <form method="dialog" class="dialog-card" id="accountForm">
+        <header class="dialog-head"><div><h2 id="accountEditorTitle">添加公众号</h2><p>填写采集配置。文章与历史互动数据不会被修改。</p></div><button class="icon-close" value="cancel" aria-label="关闭">×</button></header>
+        <input id="editRecordId" type="hidden" />
+        <label class="dialog-field" for="editName"><span>公众号名称 <em>*</em></span><input id="editName" maxlength="100" required placeholder="例如：量子位" /></label>
+        <p class="rename-note" id="renameNote" hidden>已有文章的账号不能直接改名，以免历史文章与账号脱节；如需搜索其他名称，请修改“采集搜索名”。</p>
+        <div class="dialog-grid">
+          <label class="dialog-field" for="editSearchName"><span>采集搜索名</span><input id="editSearchName" maxlength="100" placeholder="默认与公众号名称相同" /></label>
+          <label class="dialog-field" for="editSourceId"><span>原始 ID</span><input id="editSourceId" maxlength="120" placeholder="可选" /></label>
+          <label class="dialog-field" for="editCategory"><span>分类</span><input id="editCategory" list="categoryOptions" maxlength="60" placeholder="未分类" /></label>
+          <label class="dialog-field" for="editAccountType"><span>账号类型</span><input id="editAccountType" maxlength="60" value="公众号" /></label>
+        </div>
+        <datalist id="categoryOptions"></datalist>
+        <footer class="dialog-actions"><button class="text-button" value="cancel" type="button" id="cancelEdit">取消</button><button class="button primary" type="submit" id="saveAccount">保存配置</button></footer>
+      </form>
+    </dialog>
+
+    <dialog class="account-dialog" id="accountImporter">
+      <form method="dialog" class="dialog-card import-card" id="importForm">
+        <header class="dialog-head"><div><h2>导入公众号配置</h2><p>先预览新增和更新，再确认保存；文件只会改动采集账号配置。</p></div><button class="icon-close" value="cancel" aria-label="关闭">×</button></header>
+        <label class="upload-field" for="importFile"><span>选择 CSV 或 JSON 文件</span><input id="importFile" type="file" accept=".csv,.json,text/csv,application/json" /></label>
+        <p class="import-hint">建议先导出 CSV，在表格中编辑后再导入。请保留“记录ID”列，才能准确更新原有账号。</p>
+        <section class="import-preview" id="importPreview" hidden aria-live="polite"></section>
+        <footer class="dialog-actions"><button class="text-button" value="cancel" type="button" id="cancelImport">取消</button><button class="text-button" type="button" id="previewImport">预览变更</button><button class="button primary" type="button" id="applyImport" disabled>确认保存</button></footer>
+      </form>
+    </dialog>
+    <dialog class="account-dialog" id="accountExporter">
+      <form method="dialog" class="dialog-card export-card" id="exportForm">
+        <header class="dialog-head"><div><h2>导出公众号配置</h2><p>选择文件格式后立即下载。CSV 适合用 Excel 编辑，JSON 适合程序备份。</p></div><button class="icon-close" value="cancel" aria-label="关闭">×</button></header>
+        <fieldset class="export-format-list"><legend>导出格式</legend>
+          <label><input type="radio" name="exportFormat" value="csv" checked /><span><strong>CSV（推荐编辑）</strong><small>包含中文列名，可直接用 Excel 打开和回导。</small></span></label>
+          <label><input type="radio" name="exportFormat" value="json" /><span><strong>JSON（推荐备份）</strong><small>保留结构化字段，适合程序读取与版本留存。</small></span></label>
+        </fieldset>
+        <footer class="dialog-actions"><button class="text-button" value="cancel" type="button" id="cancelExport">取消</button><button class="button primary" type="submit">下载文件</button></footer>
+      </form>
+    </dialog>
+    <div class="toast" id="toast" role="status"></div>
+    <!-- 更新摘要/告警行为后更换资源版本，避免浏览器继续执行旧脚本而把“0 个待补齐”显示成警告。 -->
+    <script src="/accounts.js?v=20260803-account-summary"></script>
+  </body>
+</html>

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>文章管理 · 公众号采集</title>
+    <link rel="stylesheet" href="/app.css?v=20260802-article-export" />
+  </head>
+  <body>
+    <main class="app-shell article-shell">
+      <header class="topbar">
+        <div>
+          <h1>文章管理</h1>
+          <p>查看已写入 MongoDB 的文章与最新转发数据。</p>
+        </div>
+        <a class="back-link" href="/">返回控制台</a>
+      </header>
+      <nav class="product-nav" aria-label="主导航">
+        <a href="/">控制台</a>
+        <a href="/daily.html">团队日报</a>
+        <a href="/accounts.html">公众号管理</a>
+        <a class="active" aria-current="page" href="/articles.html">文章管理</a>
+      </nav>
+
+      <section class="article-toolbar" aria-label="文章筛选">
+        <label><span>发布日期</span><input id="dateFilter" type="date" /></label>
+        <div class="article-date-presets" aria-label="快捷日期">
+          <button class="date-preset" id="todayPreset" type="button">今天</button>
+          <button class="date-preset" id="yesterdayPreset" type="button">昨天</button>
+          <button class="date-preset" id="clearDateFilter" type="button">全部</button>
+        </div>
+        <label><span>公众号</span><input id="accountFilter" placeholder="一个或多个，如：量子位，机器之心" /></label>
+        <label><span>标题搜索</span><input id="queryFilter" placeholder="输入文章标题关键词" /></label>
+        <label><span>最低转发数</span><input id="minimumShareFilter" type="number" min="0" placeholder="例如：200" /></label>
+        <label><span>排序</span><select id="sortFilter"><option value="publish_desc">发布时间最新</option><option value="share_desc">转发数最高</option></select></label>
+        <button class="button primary" id="searchArticles" type="button">查询文章</button>
+      </section>
+
+      <section class="article-results" aria-labelledby="articleResultTitle">
+        <div class="article-results-head"><div><h2 id="articleResultTitle">文章列表</h2><p id="articleResultSummary">正在读取今天的文章…</p></div><div class="article-result-actions"><span class="data-badge">只读 MongoDB</span><button class="text-button" id="exportArticles" type="button">导出文章</button></div></div>
+        <div id="articleList" class="article-list" aria-live="polite"></div>
+        <div class="article-pagination"><button class="text-button" id="previousPage" type="button">上一页</button><span id="pageText">第 1 页</span><button class="text-button" id="nextPage" type="button">下一页</button></div>
+      </section>
+    </main>
+    <aside class="article-drawer" id="articleDrawer" aria-label="文章详情" hidden>
+      <div class="article-drawer-head"><div><p id="drawerAccount">公众号</p><h2 id="drawerTitle">文章标题</h2></div><button class="text-button" id="closeDrawer" type="button">关闭</button></div>
+      <div class="article-meta" id="drawerMeta"></div>
+      <a class="article-original-link" id="drawerUrl" target="_blank" rel="noreferrer">打开原文</a>
+      <article class="article-content" id="drawerContent">正在读取正文…</article>
+    </aside>
+    <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+    <dialog class="article-export-dialog" id="articleExporter">
+      <form method="dialog" class="article-export-card" id="articleExportForm">
+        <header><div><h2>导出文章</h2><p>按当前筛选条件导出正文与最新互动数据。多个公众号请先在上方用逗号分隔填写。</p></div><button class="text-button" value="cancel" aria-label="关闭">关闭</button></header>
+        <fieldset><legend>文件格式</legend>
+          <label><input type="radio" name="articleExportFormat" value="csv" checked /><span><strong>CSV（推荐编辑）</strong><small>适合 Excel 查看、筛选和二次分析。</small></span></label>
+          <label><input type="radio" name="articleExportFormat" value="json" /><span><strong>JSON（推荐备份）</strong><small>适合程序处理，保留结构化字段。</small></span></label>
+        </fieldset>
+        <p class="article-export-hint">为保护浏览器性能，单次最多导出 10,000 篇；超出时请缩小日期或公众号范围。</p>
+        <footer><button class="text-button" value="cancel" type="button" id="cancelArticleExport">取消</button><button class="button primary" type="submit">下载文件</button></footer>
+      </form>
+    </dialog>
+    <div class="toast" id="toast" role="status"></div>
+    <script src="/articles.js?v=20260802-article-export"></script>
+  </body>
+</html>
