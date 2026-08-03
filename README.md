@@ -9,6 +9,7 @@
 - [系统能力](#系统能力)
 - [运行架构与访问边界](#运行架构与访问边界)
 - [快速开始](#快速开始)
+- [Docker MongoDB](#docker-mongodb)
 - [微信与桌面前置条件](#微信与桌面前置条件)
 - [管理控制台](#管理控制台)
 - [定时采集](#定时采集)
@@ -87,6 +88,36 @@ $env:CONTROL_PANEL_PASSWORD="请替换为强密码"
 ```
 
 也可以直接双击 `start-control-panel.bat`，启动脚本会在本次运行中安全询问管理员密码。
+
+## Docker MongoDB
+
+Docker Desktop 已启动时，可用项目自带脚本准备并启动独立 MongoDB：
+
+```powershell
+.\mongodb.bat setup
+.\mongodb.bat start
+.\mongodb.bat status
+```
+
+默认只监听 `127.0.0.1:27019`，避免与本机已有的标准端口 `27017` 冲突。setup 会生成随机 root 密码和应用密码，写入被 Git 忽略的 `.env.mongo`；启动控制台时会自动读取该连接配置。
+
+常用维护命令：
+
+```powershell
+.\mongodb.bat logs
+.\mongodb.bat connection
+.\mongodb.bat backup
+.\mongodb.bat restart
+.\mongodb.bat stop
+```
+
+数据库恢复属于覆盖性操作，必须显式确认：
+
+```powershell
+.\mongodb.ps1 restore -BackupFile .\output\mongodb-backups\weixin-时间.archive.gz -Force
+```
+
+完整说明见 `docs/DOCKER.md` 和 `docs/DATABASE.md`。
 
 ### 2. 启动本机管理控制台
 

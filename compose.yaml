@@ -1,0 +1,33 @@
+name: wechat-article-rpa
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: wechat-article-mongodb
+    restart: unless-stopped
+    ports:
+      # 默认仅本机可访问，并使用 27019 避免与常见的本机 MongoDB 冲突。
+      - "${MONGO_BIND_IP:-127.0.0.1}:${MONGO_PORT:-27019}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-weixin}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-wechat_rpa}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+    volumes:
+      - mongo_data:/data/db
+      - ./docker/mongo-init.js:/docker-entrypoint-initdb.d/01-init.js:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --username \"$$MONGO_INITDB_ROOT_USERNAME\" --password \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval \"db.adminCommand('ping').ok\" | grep 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  mongo_data:
+    name: wechat_article_mongo_data

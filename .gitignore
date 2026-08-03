@@ -9,6 +9,7 @@ config/accounts_remaining.txt
 .env
 .env.*
 !.env.example
+!.env.mongo.example
 
 # 本地界面验收截图仅用于开发时对比，不纳入产品代码仓库。
 design-qa-*.png
