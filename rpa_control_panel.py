@@ -31,6 +31,12 @@ from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
+from env_config import load_project_env
+
+
+# 必须在读取 MongoDB、管理员密码等模块级配置前加载本机 .env。
+load_project_env()
+
 
 RPA_DIR = Path(__file__).resolve().parent
 WEB_DIR = RPA_DIR / "web"
@@ -39,17 +45,36 @@ RUN_HISTORY_PATH = RPA_DIR / "config" / "run_history.json"
 PANEL_LOG_PATH = RPA_DIR / "output" / "control-panel.log"
 PANEL_LOG_MAX_BYTES = 10 * 1024 * 1024
 RUN_HISTORY_LIMIT = 50
-ARTICLE_MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017/")
-ARTICLE_MONGO_DATABASE = os.getenv("MONGO_DATABASE", "weixin")
-ARTICLE_MONGO_COLLECTION = os.getenv("MONGO_ARTICLE_COLLECTION", "article")
-TARGET_MONGO_COLLECTION = os.getenv("MONGO_ACCOUNT_COLLECTION", "collection_target")
+ARTICLE_MONGO_URI = os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/")
+ARTICLE_MONGO_DATABASE = os.getenv("ARTICLE_MONGO_DATABASE", "weixin")
+ARTICLE_MONGO_COLLECTION = os.getenv("ARTICLE_MONGO_COLLECTION", "article")
+TARGET_MONGO_COLLECTION = os.getenv("MONGO_TARGET_COLLECTION", "collection_target")
+# daily_news_send 生成后的编辑日报归档；团队日报只读展示，不改变其发送状态。
+DAILY_REPORT_MONGO_COLLECTION = os.getenv("DAILY_REPORT_MONGO_COLLECTION", "daily_reports")
 ACCOUNT_ALIASES_PATH = RPA_DIR / "config" / "account_aliases.json"
 ARTICLE_EXPORT_LIMIT = 10_000
 # MongoDB 中的 publishDate 沿用北京时间的无时区存储，因此筛选边界也必须固定为 UTC+8。
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+# 团队资讯页只提供只读浏览能力；采集控制台、配置和导出必须由管理员访问。
 # 可通过环境变量覆盖默认凭据，便于部署时接入自己的密钥管理方式。
 CONTROL_PANEL_USERNAME = os.getenv("CONTROL_PANEL_USERNAME", "admin")
-CONTROL_PANEL_PASSWORD = os.getenv("CONTROL_PANEL_PASSWORD", "")
+CONTROL_PANEL_PASSWORD = os.getenv("CONTROL_PANEL_PASSWORD", "admin-123")
+PUBLIC_TEAM_PATHS = frozenset(
+    {
+        "/briefing.html",
+        "/briefing.css",
+        "/briefing.js",
+        "/daily.html",
+        "/daily.css",
+        "/daily.js",
+        "/directory.html",
+        "/directory.css",
+        "/directory.js",
+    }
+)
+PUBLIC_TEAM_API_PATHS = frozenset(
+    {"/api/accounts", "/api/articles", "/api/daily-report", "/api/daily-briefing"}
+)
 DEFAULT_CONFIG = {
     "enabled": False,
     "times": ["08:00", "22:00"],
@@ -87,7 +112,13 @@ DEFAULT_FAILURE_RECOVERY_HINT = "请保留本次输出目录的 run.log，并确
 
 
 def requires_control_auth(path: str) -> bool:
-    """判断请求是否属于私有采集控制台；所有业务接口均要求管理员认证。"""
+    """判断请求是否属于私有采集控制台。
+
+    团队阅读页仅包含日报、文章动态、公众号目录及只读查询接口；控制台页面、导出、
+    任务日志和所有写入接口均要求管理员认证，避免“知道地址就能启动采集”。
+    """
+    if path in PUBLIC_TEAM_PATHS or path in PUBLIC_TEAM_API_PATHS:
+        return False
     return path in {"/", "/index.html", "/accounts.html", "/articles.html"} or path.startswith("/api/")
 
 
@@ -104,7 +135,6 @@ def build_collector_command(output_dir: Path, options: dict[str, Any]) -> list[s
         str(RPA_DIR / "wechat_visual_rpa.py"),
         "--run-search-accounts",
         "--live",
-        "--local-only",
         "--accounts-from-mongo",
         "--write-mongo",
         "--metrics",
@@ -442,6 +472,324 @@ def list_articles(
         if client is not None:
             client.close()
 
+
+def _daily_report_date(value: str) -> tuple[date, datetime, datetime]:
+    """验证日报日期，并返回与 MongoDB 一致的北京时间自然日边界。"""
+    try:
+        report_day = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("日报日期必须是 YYYY-MM-DD") from exc
+    start = datetime.combine(report_day, datetime.min.time())
+    return report_day, start, start + timedelta(days=1)
+
+
+def _daily_excerpt(value: Any, limit: int = 118) -> str:
+    """日报只展示短摘要，避免把整篇正文一次传给所有浏览者。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text if len(text) <= limit else f"{text[:limit].rstrip()}…"
+
+
+def _daily_number(value: Any) -> int:
+    """互动数据可能缺失或被识别为字符串，日报统一按非负整数处理。"""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_daily_reportable_title(value: Any) -> bool:
+    """团队日报只保留资讯内容，过滤招聘、招募等账号运营信息。"""
+    title = re.sub(r"\s+", "", str(value or ""))
+    # 这是展示层规则：原始文章仍完整保存在 MongoDB，控制台也仍可查询。
+    return bool(title) and not any(keyword in title for keyword in ("招聘", "招募", "诚聘", "加入我们"))
+
+
+def _daily_briefing_time_range(report: dict[str, Any]) -> dict[str, str]:
+    """将日报归档的原始统计区间转成可直接展示的文案。
+
+    ``reportDate`` 是日报生成/发送日期，不等于资讯覆盖日期。页面必须展示
+    归档中真实记录的 ``timeRange``，不能凭“昨天”猜测，避免再次造成日期歧义。
+    """
+    time_range = report.get("timeRange") or {}
+    start = _format_datetime(time_range.get("start"))
+    end = _format_datetime(time_range.get("end"))
+    if start and end:
+        label = f"汇总范围：{start} — {end}"
+    elif start:
+        label = f"汇总起点：{start}"
+    else:
+        label = "汇总范围暂未记录"
+    return {"start": start, "end": end, "label": label}
+
+
+def _daily_briefing_sort_time(value: Any) -> float:
+    """把日报归档的生成时间标准化为可比较的时间戳。
+
+    历史归档可能同时存在 MongoDB ``datetime`` 和 ISO 字符串。直接排序会因
+    两种类型不可比较而让团队阅读页报错；这里统一按北京时间解释无时区值。
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return float("-inf")
+    else:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BEIJING_TIMEZONE)
+    return parsed.timestamp()
+
+
+def daily_briefing(
+    *, issue_date: str, report_collection: Any | None = None
+) -> dict[str, Any]:
+    """读取一份已生成的编辑日报，供团队阅读页展示；全程只读。"""
+    selected_day, _start, _end = _daily_report_date(issue_date)
+    client = None
+    if report_collection is None:
+        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
+        report_collection = client[ARTICLE_MONGO_DATABASE][DAILY_REPORT_MONGO_COLLECTION]
+    try:
+        # 日报数量远小于文章库，读取最近归档后在内存排序能兼容不同 Mongo 驱动版本，
+        # 也便于保障“同日多次生成时取最新一份”的展示口径。
+        reports = list(
+            report_collection.find(
+                {},
+                {
+                    "reportDate": 1,
+                    "generatedAt": 1,
+                    "createdAt": 1,
+                    "timeRange": 1,
+                    "articleCount": 1,
+                    "articles": 1,
+                    "reportContent": 1,
+                    "sendStatus": 1,
+                },
+            )
+        )
+        report_key = selected_day.isoformat()
+        same_day = [report for report in reports if str(report.get("reportDate") or "") == report_key]
+        same_day.sort(
+            key=lambda report: _daily_briefing_sort_time(
+                report.get("generatedAt") or report.get("createdAt")
+            ),
+            reverse=True,
+        )
+        report = same_day[0] if same_day else None
+        archive: list[dict[str, str]] = []
+        for candidate in sorted(
+            reports,
+            key=lambda item: (
+                str(item.get("reportDate") or ""),
+                _daily_briefing_sort_time(item.get("generatedAt") or item.get("createdAt")),
+            ),
+            reverse=True,
+        ):
+            date_text = str(candidate.get("reportDate") or "")
+            if not date_text or any(item["issue_date"] == date_text for item in archive):
+                continue
+            archive.append(
+                {
+                    "issue_date": date_text,
+                    "generated_at": _format_datetime(candidate.get("generatedAt") or candidate.get("createdAt")),
+                    "coverage_label": _daily_briefing_time_range(candidate)["label"],
+                }
+            )
+        if not report or not str(report.get("reportContent") or "").strip():
+            return {
+                "issue_date": report_key,
+                "issue_label": f"{selected_day.year}年{selected_day.month}月{selected_day.day}日早报",
+                "available": False,
+                "message": "该期每日新闻尚未生成。可在“文章动态”查看已采集的原始文章。",
+                "archive": archive,
+            }
+
+        articles = report.get("articles") if isinstance(report.get("articles"), list) else []
+        category_counts: dict[str, int] = {}
+        account_names: set[str] = set()
+        highlights: list[dict[str, Any]] = []
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+            category = str(article.get("category") or "未分类")
+            category_counts[category] = category_counts.get(category, 0) + 1
+            account_name = str(article.get("accountName") or "").strip()
+            if account_name:
+                account_names.add(account_name)
+            title = str(article.get("title") or "").strip()
+            if title:
+                highlights.append(
+                    {
+                        "title": title,
+                        "account_name": account_name or "未识别公众号",
+                        "url": str(article.get("url") or ""),
+                        "share_count": _daily_number(article.get("shareCount")),
+                    }
+                )
+        highlights.sort(key=lambda item: (item["share_count"], item["title"]), reverse=True)
+        return {
+            "issue_date": report_key,
+            "issue_label": f"{selected_day.year}年{selected_day.month}月{selected_day.day}日早报",
+            "available": True,
+            "generated_at": _format_datetime(report.get("generatedAt") or report.get("createdAt")),
+            "coverage": _daily_briefing_time_range(report),
+            "article_count": _daily_number(report.get("articleCount")) or len(articles),
+            "account_count": len(account_names),
+            "send_status": str(report.get("sendStatus") or "unknown"),
+            "content": str(report.get("reportContent") or "").strip(),
+            "categories": [
+                {"name": name, "count": count}
+                for name, count in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
+            ],
+            "highlights": highlights[:5],
+            "archive": archive,
+        }
+    finally:
+        if client is not None:
+            client.close()
+
+
+def daily_report(
+    *,
+    report_date: str,
+    category: str = "all",
+    account: str = "",
+    article_collection: Any | None = None,
+    target_collection: Any | None = None,
+) -> dict[str, Any]:
+    """构建同事可读的日报数据；全程只读 MongoDB，不接触采集状态和配置。"""
+    selected_day, start, end = _daily_report_date(report_date)
+    requested_category = category.strip() or "all"
+    requested_account = account.strip()
+    client = None
+    if article_collection is None or target_collection is None:
+        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
+        database = client[ARTICLE_MONGO_DATABASE]
+        article_collection = article_collection or database[ARTICLE_MONGO_COLLECTION]
+        target_collection = target_collection or database[TARGET_MONGO_COLLECTION]
+
+    try:
+        category_by_account = {
+            str(row.get("name") or "").strip(): str(row.get("category") or "未分类").strip() or "未分类"
+            for row in target_collection.find({}, {"_id": 0, "name": 1, "category": 1})
+            if str(row.get("name") or "").strip()
+        }
+        # 仅取日报真正需要的字段，正文只截取短摘要，降低局域网访问时的传输压力。
+        # 目录页跳转时按账号过滤，仍复用同一份只读日报查询，避免团队端落回控制台。
+        article_match: dict[str, Any] = {"article.publishDate": {"$gte": start, "$lt": end}}
+        if requested_account:
+            article_match["account.name"] = requested_account
+        documents = article_collection.aggregate(
+            [
+                {"$match": article_match},
+                {"$addFields": {"latestInteraction": {"$arrayElemAt": ["$interactionHistory", -1]}}},
+                {
+                    "$project": {
+                        "account.name": 1,
+                        "article.title": 1,
+                        "article.publishDate": 1,
+                        "article.url": 1,
+                        "article.content.text": 1,
+                        "latestInteraction.shareCount": 1,
+                    }
+                },
+            ]
+        )
+
+        rows: list[dict[str, Any]] = []
+        excluded_count = 0
+        for document in documents:
+            account = document.get("account") or {}
+            article = document.get("article") or {}
+            interaction = document.get("latestInteraction") or {}
+            title = str(article.get("title") or "未命名文章")
+            if not _is_daily_reportable_title(title):
+                excluded_count += 1
+                continue
+            account_name = str(account.get("name") or "未识别公众号")
+            publish_date = article.get("publishDate")
+            rows.append(
+                {
+                    "account_name": account_name,
+                    "category": category_by_account.get(account_name, "未分类"),
+                    "title": title,
+                    "url": str(article.get("url") or ""),
+                    "publish_time": _format_datetime(publish_date),
+                    "publish_order": publish_date if isinstance(publish_date, datetime) else datetime.min,
+                    "excerpt": _daily_excerpt((article.get("content") or {}).get("text")),
+                    "share_count": _daily_number(interaction.get("shareCount")),
+                }
+            )
+
+        category_counts: dict[str, int] = {}
+        for row in rows:
+            category_counts[row["category"]] = category_counts.get(row["category"], 0) + 1
+        categories = [{"key": "all", "label": "全部", "count": len(rows)}]
+        categories.extend(
+            {"key": name, "label": name, "count": count}
+            for name, count in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+        if requested_category != "all" and requested_category not in category_counts:
+            raise ValueError("该分类在当前日报日期中不存在")
+        visible_rows = rows if requested_category == "all" else [row for row in rows if row["category"] == requested_category]
+        # 热点先按转发数排序；同分时优先展示发布时间更晚的文章。
+        hot_items = sorted(
+            visible_rows,
+            key=lambda row: (row["share_count"], row["publish_order"], row["title"]),
+            reverse=True,
+        )[:5]
+        # 团队文章流与“今日热点”保持同一排序口径：优先展示转发更高的内容，
+        # 同分时再按发布时间和标题稳定排序，方便同事快速发现传播度更高的文章。
+        feed_items = sorted(
+            visible_rows,
+            key=lambda row: (row["share_count"], row["publish_order"], row["title"]),
+            reverse=True,
+        )[:30]
+
+        activity: dict[str, dict[str, Any]] = {}
+        for row in visible_rows:
+            item = activity.setdefault(
+                row["account_name"], {"account_name": row["account_name"], "count": 0, "latest": datetime.min, "articles": []}
+            )
+            item["count"] += 1
+            item["latest"] = max(item["latest"], row["publish_order"])
+            item["articles"].append(row)
+        account_activity = []
+        for item in sorted(activity.values(), key=lambda value: (-value["count"], value["account_name"]))[:6]:
+            latest_articles = sorted(item["articles"], key=lambda row: row["publish_order"], reverse=True)[:3]
+            account_activity.append(
+                {
+                    "account_name": item["account_name"],
+                    "count": item["count"],
+                    "articles": [
+                        {"title": row["title"], "publish_time": row["publish_time"], "url": row["url"]}
+                        for row in latest_articles
+                    ],
+                }
+            )
+        return {
+            "date": selected_day.isoformat(),
+            "date_label": f"{selected_day.year}年{selected_day.month}月{selected_day.day}日",
+            "summary": {
+                "article_count": len(rows),
+                "visible_count": len(visible_rows),
+                "account_count": len({row["account_name"] for row in rows}),
+                "share_count": sum(row["share_count"] for row in rows),
+                "excluded_count": excluded_count,
+            },
+            "selected_category": requested_category,
+            "selected_account": requested_account,
+            "categories": categories,
+            "lead": hot_items[0] if hot_items else None,
+            "hot_items": hot_items,
+            "feed_items": feed_items,
+            "account_activity": account_activity,
+        }
+    finally:
+        if client is not None:
+            client.close()
 
 
 def article_export_rows(
@@ -1058,6 +1406,28 @@ def format_process_event_message(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def determine_final_run_status(
+    *,
+    exit_code: int,
+    manually_stopped: bool,
+    summary: dict[str, Any],
+) -> tuple[str, str]:
+    """结合退出码与业务失败数确定状态，避免“失败 69 个”仍显示已完成。"""
+    if manually_stopped:
+        return "cancelled", "已手动停止"
+    if exit_code != 0:
+        return "failed", "任务异常退出"
+    failed_accounts = int(summary.get("accounts_failed") or 0)
+    successful_accounts = int(summary.get("accounts_succeeded") or 0) + int(
+        summary.get("accounts_no_updates") or 0
+    )
+    if failed_accounts and not successful_accounts:
+        return "failed", "任务执行结束，但全部公众号采集失败"
+    if failed_accounts:
+        return "partial", "任务执行结束，部分公众号采集失败"
+    return "completed", "任务执行完成"
+
+
 class ControlState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -1383,7 +1753,7 @@ class ControlState:
             output_dir.mkdir(parents=True, exist_ok=True)
             command = build_collector_command(output_dir, options)
             environment = os.environ.copy()
-            environment.setdefault("MONGO_URI", "mongodb://127.0.0.1:27017/")
+            environment.setdefault("MONGO_URI", "mongodb://192.168.28.70:27019/")
             # 子进程日志统一使用 UTF-8，避免中文账号在管理页面中显示为乱码。
             environment["PYTHONIOENCODING"] = "utf-8"
             creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1469,11 +1839,16 @@ class ControlState:
             active_process = self.process is process and self.active_run_id == run_id
             manually_stopped = self.stop_requested if active_process else False
             finished_at = datetime.now().isoformat(timespec="seconds")
-            final_status = "cancelled" if manually_stopped else ("completed" if exit_code == 0 else "failed")
-            final_event = (
-                "已手动停止"
-                if manually_stopped
-                else ("任务执行完成" if exit_code == 0 else "任务异常退出")
+            if active_process:
+                final_summary = self._run_summary_locked()
+            else:
+                # 旧 reader 晚于新任务退出时，只能使用自己的历史快照，不能借用新任务进度。
+                previous_record = self.history.get(run_id) or {}
+                final_summary = dict(previous_record.get("summary") or {})
+            final_status, final_event = determine_final_run_status(
+                exit_code=exit_code,
+                manually_stopped=manually_stopped,
+                summary=final_summary,
             )
             if active_process:
                 self.exit_code = exit_code
@@ -1499,8 +1874,12 @@ class ControlState:
         if manually_stopped:
             self.add_log("warning", f"采集任务已手动停止，返回码：{exit_code}。")
             return
-        if exit_code == 0:
+        if final_status == "completed":
             self.add_log("success", "采集任务执行完成。")
+        elif final_status == "partial":
+            self.add_log("warning", "采集任务已结束，但存在公众号采集失败，请查看任务诊断。")
+        elif final_status == "failed" and exit_code == 0:
+            self.add_log("error", "采集任务已结束，但全部公众号采集失败，请先恢复微信和搜一搜窗口。")
         else:
             self.add_log("error", f"采集任务退出，返回码：{exit_code}。")
 
@@ -1788,6 +2167,31 @@ class ControlHandler(SimpleHTTPRequestHandler):
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取公众号失败：{exc}"}, HTTPStatus.BAD_REQUEST)
             return
+        if parsed.path == "/api/daily-report":
+            query = parse_qs(parsed.query)
+            try:
+                report_date = str(query.get("date", [beijing_today().isoformat()])[0])
+                result = daily_report(
+                    report_date=report_date,
+                    category=str(query.get("category", ["all"])[0]),
+                    account=str(query.get("account", [""])[0]),
+                )
+                self._json({"ok": True, **result})
+            except PyMongoError as exc:
+                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except (ValueError, OSError) as exc:
+                self._json({"ok": False, "message": f"读取日报失败：{exc}"}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/daily-briefing":
+            query = parse_qs(parsed.query)
+            try:
+                issue_date = str(query.get("date", [beijing_today().isoformat()])[0])
+                self._json({"ok": True, **daily_briefing(issue_date=issue_date)})
+            except PyMongoError as exc:
+                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            except (ValueError, OSError) as exc:
+                self._json({"ok": False, "message": f"读取每日新闻失败：{exc}"}, HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path == "/api/articles":
             query = parse_qs(parsed.query)
             try:
@@ -1976,8 +2380,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not CONTROL_PANEL_PASSWORD:
-        raise RuntimeError("启动控制台前必须设置环境变量 CONTROL_PANEL_PASSWORD")
     threading.Thread(target=scheduler_loop, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), ControlHandler)
     url = f"http://{args.host}:{args.port}/"

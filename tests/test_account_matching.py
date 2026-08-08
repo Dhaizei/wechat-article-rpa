@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import unittest
 import json
 import tempfile
-import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -46,16 +46,22 @@ class AccountMatchingTests(unittest.TestCase):
         self.assertEqual(method, "")
 
     def test_alias_only_changes_the_search_name(self) -> None:
-        # 使用临时配置验证行为，避免开源测试依赖任何真实公众号别名。
-        with tempfile.TemporaryDirectory() as temp_dir:
-            alias_path = Path(temp_dir) / "account_aliases.json"
+        # 开源包不携带用户私有的别名配置，测试时使用临时夹具验证解析逻辑。
+        with tempfile.TemporaryDirectory() as tmp:
+            alias_path = Path(tmp) / "account_aliases.json"
             alias_path.write_text(
-                json.dumps({"示例数据库账号": "示例微信账号"}, ensure_ascii=False),
+                json.dumps({"通义千问Qwen": "千问大模型", "通义大模型": "千问大模型"}, ensure_ascii=False),
                 encoding="utf-8",
             )
             with patch("wechat_visual_rpa.ACCOUNT_ALIASES_PATH", alias_path):
-                self.assertEqual(resolve_search_account_name("示例数据库账号"), "示例微信账号")
+                self.assertEqual(resolve_search_account_name("通义千问Qwen"), "千问大模型")
+                self.assertEqual(resolve_search_account_name("通义大模型"), "千问大模型")
                 self.assertEqual(resolve_search_account_name("不存在的账号"), "不存在的账号")
+
+    def test_verified_identity_suffix_is_accepted(self) -> None:
+        matched, method = _account_name_match("书生Intern", "书生Intern事业单位")
+        self.assertTrue(matched)
+        self.assertEqual(method, "safe-suffix-alias")
 
     def test_filter_and_account_not_found_errors_are_separated(self) -> None:
         self.assertEqual(

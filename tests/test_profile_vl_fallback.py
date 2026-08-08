@@ -16,6 +16,30 @@ import wechat_visual_rpa as rpa
 
 
 class ProfileVLFallbackTests(unittest.TestCase):
+    def test_profile_header_accepts_exact_qwen_name_when_matched_flag_is_false(self) -> None:
+        """兼容网关误写 matched 时，精确名称和高置信度仍可安全确认。"""
+        self.assertTrue(
+            rpa._qwen_profile_header_confirmed(
+                {"matched": False, "name": "书生Intern", "confidence": 0.98},
+                "书生Intern",
+            )
+        )
+
+    def test_profile_header_rejects_wrong_name_or_low_confidence(self) -> None:
+        """模型不得凭 matched=true 接受其他公众号，也不得接受低置信结果。"""
+        self.assertFalse(
+            rpa._qwen_profile_header_confirmed(
+                {"matched": True, "name": "雅书生Intern", "confidence": 0.99},
+                "书生Intern",
+            )
+        )
+        self.assertFalse(
+            rpa._qwen_profile_header_confirmed(
+                {"matched": True, "name": "书生Intern", "confidence": 0.52},
+                "书生Intern",
+            )
+        )
+
     def test_qwen_search_target_requires_exact_account_name_and_valid_coordinates(self) -> None:
         """Qwen 只能在精确名称和合法坐标同时存在时返回可点击卡片。"""
         client = Mock()

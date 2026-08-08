@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="面向团队成员的公众号文章动态，按文章发布时间浏览热点与来源。" />
+    <title>文章动态</title>
+    <link rel="stylesheet" href="/daily.css?v=20260803-article-feed" />
+  </head>
+  <body>
+    <main class="daily-shell">
+      <header class="daily-header">
+        <a class="daily-brand" href="/briefing.html" aria-label="打开团队资讯日报"><span aria-hidden="true">▣</span> 团队资讯日报</a>
+        <nav class="daily-product-nav" aria-label="团队阅读导航">
+          <a href="/briefing.html">每日新闻</a>
+          <a class="active" aria-current="page" href="/daily.html">文章动态</a>
+          <a href="/directory.html">公众号目录</a>
+        </nav>
+        <div class="daily-date-control" aria-label="选择日报日期">
+          <button id="previousDay" type="button" aria-label="前一天">‹</button>
+          <input id="reportDate" type="date" aria-label="日报日期" />
+          <button id="nextDay" type="button" aria-label="后一天">›</button>
+        </div>
+        <p id="dailyStatus">正在读取文章动态…</p>
+      </header>
+
+      <section class="daily-overview" aria-label="今日概览">
+        <article class="daily-lead" id="dailyLead"><p class="daily-loading">正在读取主推文章…</p></article>
+        <aside class="daily-hot" aria-labelledby="hotTitle">
+          <div class="daily-section-head"><h2 id="hotTitle">今日热点</h2><span>按转发数</span></div>
+          <ol id="hotList" class="hot-list"></ol>
+        </aside>
+      </section>
+
+      <nav class="daily-categories" id="dailyCategories" aria-label="文章分类"></nav>
+
+      <section class="daily-content">
+        <section class="daily-feed" aria-labelledby="feedTitle">
+          <div class="daily-section-head"><div><h2 id="feedTitle">今日文章</h2><p id="feedSummary">—</p></div></div>
+          <div id="dailyFeed" class="daily-feed-grid" aria-live="polite"></div>
+        </section>
+        <aside class="daily-activity" aria-labelledby="activityTitle">
+          <div class="daily-section-head"><h2 id="activityTitle">公众号动态</h2></div>
+          <div id="accountActivity" class="activity-list"></div>
+        </aside>
+      </section>
+
+      <footer class="daily-footer">数据来自公众号采集库 · 仅供团队浏览</footer>
+    </main>
+    <div class="daily-toast" id="dailyToast" role="status"></div>
+    <!-- 日期标题逻辑更新后使用新版本参数，避免团队端缓存旧脚本仍显示“今日文章”。 -->
+    <script src="/daily.js?v=20260803-account-date-label"></script>
+  </body>
+</html>

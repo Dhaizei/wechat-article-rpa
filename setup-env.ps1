@@ -88,4 +88,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "Dependency verification failed. Review the error above."
 }
 
+$envExamplePath = Join-Path $PSScriptRoot ".env.example"
+$envPath = Join-Path $PSScriptRoot ".env"
+if ((Test-Path -LiteralPath $envExamplePath) -and -not (Test-Path -LiteralPath $envPath)) {
+    # 只在首次安装时创建，绝不覆盖用户已经填写的密钥和连接配置。
+    Copy-Item -LiteralPath $envExamplePath -Destination $envPath
+    Write-Host "Created .env from .env.example. Edit it before starting the collector." -ForegroundColor Yellow
+}
+
 Write-Host "`nInstallation completed. Run start-rpa.bat to begin." -ForegroundColor Green

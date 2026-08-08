@@ -193,6 +193,7 @@ function statusLabel(status) {
   return {
     running: "执行中",
     completed: "已完成",
+    partial: "部分失败",
     cancelled: "已停止",
     blocked: "前置条件不足",
     interrupted: "已中断",

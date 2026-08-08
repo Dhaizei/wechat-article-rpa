@@ -16,16 +16,29 @@ import time
 import unicodedata
 from ctypes import wintypes
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageChops, ImageGrab, ImageStat
 from pymongo import MongoClient
 
+from env_config import load_project_env
+
+
+# 命令行直接启动采集器时也自动加载项目配置，不依赖 PowerShell 会话变量。
+load_project_env()
+
 from qwen_vision import QwenVisionClient, QwenVisionConfig
 from article_evidence_ocr import ArticleEvidenceOCR
-from article_ingest import append_local_exports, ingest, load_cached_page, parse_page
+from article_ingest import (
+    append_local_exports,
+    ingest,
+    load_cached_page,
+    parse_page,
+    parse_publish_time,
+    shanghai_timezone,
+)
 from interaction_ocr import InteractionOCR
 from wechat_feed_ocr import WeChatFeedOCR
 from wechat_ocr import WeChatOCR
@@ -42,12 +55,239 @@ ctypes.windll.kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
 RPA_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = RPA_DIR / "output"
 ACCOUNT_ALIASES_PATH = RPA_DIR / "config" / "account_aliases.json"
+COPY_LINK_POSITION_CACHE_PATH = Path(
+    os.getenv("RPA_COPY_LINK_CACHE_PATH", str(RPA_DIR / "config" / "ui_position_cache.json"))
+)
 FEED_OCR = WeChatFeedOCR()
 INTERACTION_OCR = InteractionOCR()
 PROFILE_OCR = WeChatProfileOCR()
 ARTICLE_EVIDENCE_OCR = ArticleEvidenceOCR()
 RUN_LOGGER = logging.getLogger("wechat_rpa")
 WINDOW_LAYOUT_MODE = "auto"
+
+
+def _read_ui_position_cache() -> dict[str, Any]:
+    """读取界面坐标缓存；损坏或不存在时按空缓存处理。"""
+    try:
+        raw = json.loads(COPY_LINK_POSITION_CACHE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {"version": 1}
+    return raw if isinstance(raw, dict) else {"version": 1}
+
+
+def _write_ui_position_cache(payload: dict[str, Any]) -> None:
+    """原子写入界面坐标缓存，避免进程退出时留下半个 JSON 文件。"""
+    COPY_LINK_POSITION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = COPY_LINK_POSITION_CACHE_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path.replace(COPY_LINK_POSITION_CACHE_PATH)
+
+
+def _compatible_cached_position(key: str, rect: "Rect", dpi: int) -> dict[str, Any] | None:
+    """读取与当前窗口尺寸、DPI 相容的归一化坐标。"""
+    cached = _read_ui_position_cache().get(key)
+    if not isinstance(cached, dict):
+        return None
+    try:
+        x_1000 = int(cached["center_x_1000"])
+        y_1000 = int(cached["center_y_1000"])
+        cached_dpi = int(cached["dpi"])
+        cached_width = int(cached["window_width"])
+        cached_height = int(cached["window_height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (0 <= x_1000 <= 1000 and 0 <= y_1000 <= 1000):
+        return None
+    width_ratio = rect.width / max(cached_width, 1)
+    height_ratio = rect.height / max(cached_height, 1)
+    if abs(cached_dpi - dpi) > 24 or not (0.8 <= width_ratio <= 1.25) or not (0.8 <= height_ratio <= 1.25):
+        return None
+    return cached
+
+
+def _save_ui_position(key: str, action: dict[str, Any], rect: "Rect", dpi: int, source: str) -> None:
+    """保存一个已经通过后续行为验证的界面坐标，同时保留其他坐标。"""
+    payload = _read_ui_position_cache()
+    payload["version"] = 1
+    payload[key] = {
+        "center_x_1000": int(action["center_x_1000"]),
+        "center_y_1000": int(action["center_y_1000"]),
+        "dpi": dpi,
+        "window_width": rect.width,
+        "window_height": rect.height,
+        "source": source,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    _write_ui_position_cache(payload)
+
+
+def _clear_ui_position(key: str, reason: str) -> None:
+    """只删除指定坐标，避免一个控件失效时连带清除其他有效缓存。"""
+    try:
+        payload = _read_ui_position_cache()
+        removed = payload.pop(key, None)
+        if removed is not None:
+            _write_ui_position_cache(payload)
+    except OSError as exc:
+        log_event("ui_position_cache_clear_failed", key=key, reason=reason, error=str(exc))
+        return
+    log_event("ui_position_cache_cleared", key=key, reason=reason)
+
+
+def load_copy_link_position_cache(rect: "Rect", dpi: int) -> dict[str, Any] | None:
+    """读取上一次验证成功的“复制链接”归一化坐标。
+
+    缓存只提供一个候选区域，后续仍需用小区域 OCR 验证；窗口尺寸或 DPI
+    变化过大时直接放弃缓存，避免把另一台电脑上的坐标当成当前坐标使用。
+    """
+    return _compatible_cached_position("copy_link", rect, dpi)
+
+
+def save_copy_link_position_cache(action: dict[str, Any], rect: "Rect", dpi: int, source: str) -> None:
+    """持久化已经通过剪贴板 URL 校验的菜单坐标。"""
+    try:
+        _save_ui_position("copy_link", action, rect, dpi, source)
+    except OSError as exc:
+        # 缓存不可写不能阻塞采集，当前文章仍然可以依靠本次 OCR 结果继续。
+        log_event("copy_link_position_cache_write_failed", error=str(exc))
+
+
+def clear_copy_link_position_cache(reason: str) -> None:
+    """缓存失效后立即移除，避免下一篇文章再次落入同一个错误坐标。"""
+    _clear_ui_position("copy_link", reason)
+
+
+def load_menu_button_position_cache(rect: "Rect", dpi: int) -> dict[str, Any] | None:
+    """读取上一次完成合法 URL 复制时使用的浏览器菜单按钮坐标。"""
+    return _compatible_cached_position("menu_button", rect, dpi)
+
+
+def save_menu_button_position_cache(action: dict[str, Any], rect: "Rect", dpi: int, source: str) -> None:
+    """保存已由完整复制链接流程验证成功的浏览器菜单按钮坐标。"""
+    try:
+        _save_ui_position("menu_button", action, rect, dpi, source)
+    except OSError as exc:
+        log_event("menu_button_position_cache_write_failed", error=str(exc))
+
+
+def clear_menu_button_position_cache(reason: str) -> None:
+    """动态菜单按钮失效后只清除该按钮缓存。"""
+    _clear_ui_position("menu_button", reason)
+
+
+def validate_cached_copy_link_action(
+    screenshot: Image.Image,
+    cached: dict[str, Any],
+) -> dict[str, Any]:
+    """仅 OCR 缓存坐标附近的小区域，确认文字仍然是“复制链接”。"""
+    width, height = screenshot.size
+    center_x = width * int(cached["center_x_1000"]) / 1000
+    center_y = height * int(cached["center_y_1000"]) / 1000
+    # 让候选文字位于裁剪区域上半部，兼容 locate_copy_link_action 的菜单区域约束。
+    left = max(0, round(center_x - width * 0.14))
+    top = max(0, round(center_y - height * 0.05))
+    right = min(width, round(center_x + width * 0.14))
+    bottom = min(height, round(center_y + height * 0.13))
+    if right - left < 20 or bottom - top < 20:
+        return {"found": False, "reason": "缓存坐标附近区域过小"}
+    region = screenshot.crop((left, top, right, bottom))
+    action = PROFILE_OCR.locate_copy_link_action(region)
+    if not action.get("found"):
+        return {"found": False, "reason": str(action.get("reason") or "缓存区域未识别到复制链接")}
+    region_width, region_height = region.size
+    full_x = left + region_width * int(action["center_x_1000"]) / 1000
+    full_y = top + region_height * int(action["center_y_1000"]) / 1000
+    return {
+        **action,
+        "center_x_1000": round(full_x * 1000 / width),
+        "center_y_1000": round(full_y * 1000 / height),
+        "method": "cached-position-roi-rapidocr",
+    }
+
+
+def validate_cached_menu_button_action(
+    screenshot: Image.Image,
+    cached: dict[str, Any],
+) -> dict[str, Any]:
+    """校验已成功复制过公众号 URL 的浏览器菜单坐标。
+
+    缓存本身已经经过“复制链接 + 合法公众号 URL”验证。当前页面可能还包含
+    文章自身的三点按钮，因此实时识别到另一个三点时，不能反过来淘汰可靠缓存；
+    真正的失效由后续菜单文字与剪贴板 URL 双重校验确认。
+    """
+    try:
+        cached_x = int(cached["center_x_1000"])
+        cached_y = int(cached["center_y_1000"])
+    except (KeyError, TypeError, ValueError):
+        return {"found": False, "reason": "菜单按钮缓存坐标格式错误"}
+    if not (450 <= cached_x <= 980 and 0 <= cached_y <= 120):
+        return {"found": False, "reason": "菜单按钮缓存坐标不在浏览器顶部工具栏内"}
+
+    detected = PROFILE_OCR.locate_browser_menu_button(screenshot)
+    if detected.get("found"):
+        try:
+            distance_x = abs(int(detected["center_x_1000"]) - cached_x)
+            distance_y = abs(int(detected["center_y_1000"]) - cached_y)
+        except (KeyError, TypeError, ValueError):
+            distance_x = distance_y = 1000
+        if distance_x <= 55 and distance_y <= 35:
+            return {**detected, "method": "cached-menu-button-opencv"}
+
+    # OCR/OpenCV 没找到缓存附近的按钮，或找到了网页里的另一个三点。
+    # 先按已验证缓存尝试；若菜单文字/URL 校验失败，调用方会清缓存并降级识别。
+    return {
+        "found": True,
+        "center_x_1000": cached_x,
+        "center_y_1000": cached_y,
+        "confidence": float(cached.get("confidence") or 1.0),
+        "method": "cached-menu-button-verified-position",
+        "live_detection_found": bool(detected.get("found")),
+    }
+
+
+def normalize_qwen_copy_link_action(result: dict[str, Any]) -> dict[str, Any]:
+    """把 Qwen-VL 返回值收紧为可点击的“复制链接”动作。"""
+    if not result.get("found") or str(result.get("label") or "").replace(" ", "") != "复制链接":
+        return {"found": False, "reason": "Qwen-VL 未确认精确的复制链接菜单项"}
+    try:
+        x_1000 = int(result["center_x_1000"])
+        y_1000 = int(result["center_y_1000"])
+        confidence = float(result.get("confidence") or 0)
+    except (KeyError, TypeError, ValueError):
+        return {"found": False, "reason": "Qwen-VL 返回坐标格式错误"}
+    if not (0 <= x_1000 <= 1000 and 0 <= y_1000 <= 1000) or confidence < 0.75:
+        return {"found": False, "reason": "Qwen-VL 坐标越界或置信度不足"}
+    return {
+        "found": True,
+        "text": "复制链接",
+        "center_x_1000": x_1000,
+        "center_y_1000": y_1000,
+        "confidence": confidence,
+        "method": "qwen-vl-copy-link-fallback",
+    }
+
+
+def normalize_qwen_menu_button_action(result: dict[str, Any]) -> dict[str, Any]:
+    """只接受 Qwen-VL 明确认出的浏览器标题栏三点菜单按钮。"""
+    label = str(result.get("label") or "").replace(" ", "")
+    if not result.get("found") or label not in {"...", "…", "⋯", "更多", "三点菜单"}:
+        return {"found": False, "reason": "Qwen-VL 未确认浏览器三点菜单按钮"}
+    try:
+        x_1000 = int(result["center_x_1000"])
+        y_1000 = int(result["center_y_1000"])
+        confidence = float(result.get("confidence") or 0)
+    except (KeyError, TypeError, ValueError):
+        return {"found": False, "reason": "Qwen-VL 菜单按钮坐标格式错误"}
+    # 菜单按钮必须位于文章窗口标题栏右侧，防止选择正文或页面内的省略号。
+    if not (450 <= x_1000 <= 950 and 0 <= y_1000 <= 140) or confidence < 0.80:
+        return {"found": False, "reason": "Qwen-VL 菜单按钮位置越界或置信度不足"}
+    return {
+        "found": True,
+        "center_x_1000": x_1000,
+        "center_y_1000": y_1000,
+        "confidence": confidence,
+        "method": "qwen-vl-browser-menu-button",
+    }
 
 
 def resolve_search_account_name(account_name: str) -> str:
@@ -349,12 +589,10 @@ def normalized_bbox_to_pixels(values: list[int], image: Image.Image) -> tuple[in
 
 
 def find_wechat_manager_window() -> tuple[int, Rect]:
-    candidates: list[tuple[int, Rect, int]] = []
+    candidates: list[tuple[int, str, int]] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def callback(hwnd: int, _lparam: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
-            return True
         length = user32.GetWindowTextLengthW(hwnd)
         if not length:
             return True
@@ -367,17 +605,36 @@ def find_wechat_manager_window() -> tuple[int, Rect]:
         if title.value.strip() != "微信" or not (is_qt_window or is_chrome_window):
             return True
         raw = wintypes.RECT()
+        initial_area = 0
         if user32.GetWindowRect(hwnd, ctypes.byref(raw)):
-            rect = Rect(raw.left, raw.top, raw.right, raw.bottom)
-            if rect.width > 700 and rect.height > 600:
-                candidates.append((hwnd, rect, rect.width * rect.height))
+            initial_area = max(0, raw.right - raw.left) * max(0, raw.bottom - raw.top)
+        # 最小化窗口的当前矩形可能非常小，不能在恢复前用尺寸把它过滤掉。
+        candidates.append((hwnd, class_name.value, initial_area))
         return True
 
     user32.EnumWindows(callback, 0)
-    if not candidates:
-        raise RuntimeError("没有找到已打开的微信公众号管理窗口")
-    hwnd, rect, _ = max(candidates, key=lambda item: item[2])
-    return hwnd, rect
+    # 传统 Qt 主窗口优先；新版 Chromium 微信则按恢复前面积排序。
+    candidates.sort(
+        key=lambda item: (item[1].startswith("Qt"), item[2]),
+        reverse=True,
+    )
+    for hwnd, class_name, _initial_area in candidates:
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        time.sleep(0.15)
+        raw = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(raw)):
+            continue
+        rect = Rect(raw.left, raw.top, raw.right, raw.bottom)
+        if rect.width > 700 and rect.height > 600:
+            log_event(
+                "wechat_manager_window_recovered",
+                hwnd=hwnd,
+                class_name=class_name,
+                width=rect.width,
+                height=rect.height,
+            )
+            return hwnd, rect
+    raise RuntimeError("没有找到已打开的微信公众号管理窗口（已尝试恢复最小化窗口）")
 
 
 def find_article_window() -> tuple[int, Rect]:
@@ -433,6 +690,73 @@ def _tab_switch_difference(before: Image.Image, after: Image.Image) -> float:
     return float(ImageStat.Stat(difference).mean[0])
 
 
+def _inspect_sogou_search_results(screenshot: Image.Image) -> dict[str, Any]:
+    """同时验证搜索框与“账号”导航，避免把文章分享弹窗误认成搜一搜。"""
+    search_box = PROFILE_OCR.locate_search_box(screenshot)
+    account_tab = PROFILE_OCR.locate_account_tab(screenshot)
+    return {
+        "found": bool(search_box.get("found") and account_tab.get("found")),
+        "search_box": search_box,
+        "account_tab": account_tab,
+    }
+
+
+def find_and_pin_search_tab(
+    search_window: WindowInfo,
+    account_name: str,
+    *,
+    max_tabs: int = 20,
+) -> bool:
+    """遍历现有标签找到真正的搜一搜结果页，并将它移动到第一个标签。"""
+    activate_window(search_window.hwnd)
+    press_ctrl_1()
+    time.sleep(0.35)
+    for index in range(max_tabs):
+        screenshot = capture_window(search_window.rect)
+        evidence = _inspect_sogou_search_results(screenshot)
+        log_event(
+            "sogou_search_tab_probe",
+            account=account_name,
+            tab_index=index + 1,
+            found=bool(evidence["found"]),
+            search_box_found=bool(evidence["search_box"].get("found")),
+            account_tab_found=bool(evidence["account_tab"].get("found")),
+        )
+        if evidence["found"]:
+            # Chromium 用 Ctrl+Shift+PageUp 将当前标签逐格向左移动。
+            for _ in range(index):
+                activate_window(search_window.hwnd)
+                press_ctrl_shift_pageup()
+                time.sleep(0.12)
+            activate_window(search_window.hwnd)
+            press_ctrl_1()
+            time.sleep(0.35)
+            validation = _inspect_sogou_search_results(capture_window(search_window.rect))
+            if not validation["found"]:
+                log_event(
+                    "sogou_search_tab_pin_failed",
+                    account=account_name,
+                    original_tab_index=index + 1,
+                )
+                return False
+            log_event(
+                "sogou_search_tab_pinned",
+                account=account_name,
+                original_tab_index=index + 1,
+                moved_left=index,
+            )
+            return True
+        activate_window(search_window.hwnd)
+        press_ctrl_tab()
+        time.sleep(0.35)
+    log_event(
+        "sogou_search_tab_not_found",
+        account=account_name,
+        inspected_tabs=max_tabs,
+    )
+    return False
+
+
 def keep_only_search_tab(
     search_window: WindowInfo,
     account_name: str,
@@ -440,41 +764,72 @@ def keep_only_search_tab(
 ) -> int:
     """清理历史遗留标签，只保留当前搜一搜页，保证采集时最多再打开一个文章标签。"""
     activate_window(search_window.hwnd)
+    # 搜一搜约定固定在首标签。每轮从首标签重新建立基准，再跳到最右侧标签清理，
+    # 避免文章页或分享弹窗里的输入框被误识别成搜一搜搜索框后提前停止。
+    press_ctrl_1()
+    time.sleep(0.35)
     baseline = capture_window(search_window.rect)
-    if not PROFILE_OCR.locate_search_box(baseline).get("found"):
+    if not _inspect_sogou_search_results(baseline)["found"]:
         return 0
+    # 先测量当前电脑、远程桌面压缩和页面动画带来的自然波动，避免使用某台电脑的固定阈值。
+    time.sleep(0.2)
+    stable_baseline = capture_window(search_window.rect)
+    idle_difference = _tab_switch_difference(baseline, stable_baseline)
+    baseline = stable_baseline
+    single_tab_threshold = max(0.35, min(12.0, idle_difference * 3.0 + 0.5))
+    log_event(
+        "browser_tab_cleanup_calibrated",
+        account=account_name,
+        idle_difference=round(idle_difference, 3),
+        single_tab_threshold=round(single_tab_threshold, 3),
+    )
     removed = 0
     for index in range(20):
-        press_ctrl_tab()
-        time.sleep(0.25)
+        # 每次按键前重新激活同一个 HWND，防止远程桌面或公众号资料窗口抢走焦点。
+        activate_window(search_window.hwnd)
+        press_ctrl_9()
+        time.sleep(0.35)
         candidate = capture_window(search_window.rect)
         difference = _tab_switch_difference(baseline, candidate)
+        candidate_evidence = _inspect_sogou_search_results(candidate)
+        candidate_has_search_box = bool(candidate_evidence["search_box"].get("found"))
+        candidate_is_search_page = bool(candidate_evidence["found"])
         log_event(
             "browser_tab_probe",
             account=account_name,
             probe=index + 1,
             difference=round(difference, 3),
+            single_tab_threshold=round(single_tab_threshold, 3),
+            strategy="last_tab",
+            candidate_has_search_box=candidate_has_search_box,
+            candidate_is_search_page=candidate_is_search_page,
         )
-        # 只有一个标签时 Ctrl+Tab 不会切页，截图差异仅来自光标或轻微动画。
+        # 只有一个标签时 Ctrl+9 不会切页，截图差异仅来自光标或轻微动画。
         if difference < 0.35:
             break
-        # 页面内的轻微动画有时会被误判为标签切换。只要当前页面仍能识别到搜一搜顶部搜索框，
-        # 就把它当作需要保留的搜索页，绝不继续 Ctrl+W 关闭，避免误关最后一个搜一搜窗口。
-        if PROFILE_OCR.locate_search_box(candidate).get("found"):
+        # 搜索结果页的动态内容会造成中等截图差异；只有差异较小且仍识别到搜索框时才保护首标签。
+        # 文章分享弹窗同样含搜索框，但与搜一搜基准差异通常显著，不能据此放弃清理。
+        if candidate_is_search_page and difference <= single_tab_threshold:
             log_event(
                 "browser_tab_cleanup_stopped",
                 account=account_name,
                 probe=index + 1,
-                reason="search_page_detected_after_tab_probe",
+                reason="single_search_page_with_dynamic_content",
+                difference=round(difference, 3),
             )
             break
+        activate_window(search_window.hwnd)
         press_ctrl_w()
         removed += 1
         time.sleep(0.35)
         if not user32.IsWindow(search_window.hwnd):
             raise RuntimeError("清理浏览器标签时搜一搜窗口被意外关闭")
+        # 关闭最右侧标签后可能落在另一个文章标签，必须显式回到首标签再校验。
+        activate_window(search_window.hwnd)
+        press_ctrl_1()
+        time.sleep(0.35)
         baseline = capture_window(search_window.rect)
-        if not PROFILE_OCR.locate_search_box(baseline).get("found"):
+        if not _inspect_sogou_search_results(baseline)["found"]:
             raise RuntimeError("清理浏览器标签后没有回到搜一搜页面")
     else:
         raise RuntimeError("已清理20个历史标签但仍检测到其他标签，请人工检查浏览器")
@@ -486,15 +841,24 @@ def keep_only_search_tab(
 
 
 def close_article_tabs_until_search(account_name: str) -> None:
-    """先回到首个搜索标签，确认无误后再关闭其他标签，绝不盲目连关。"""
+    """先定位并固定搜索标签，再关闭其他标签，绝不盲目连关。"""
     # 只能从明确识别为搜一搜的窗口开始清理，禁止把任意微信窗口当作搜索窗口。
     search_window = find_sogou_search_window()
-    activate_window(search_window.hwnd)
-    press_ctrl_1()
-    time.sleep(0.35)
-    screenshot = capture_window(search_window.rect)
-    if not PROFILE_OCR.locate_search_box(screenshot).get("found"):
-        raise RuntimeError("首个标签不是搜一搜页面，为保护搜索页拒绝自动关闭任何标签")
+    if not find_and_pin_search_tab(search_window, account_name):
+        # 搜索标签可能已被异常流程关闭或替换。此时不在旧窗口里继续盲目 Ctrl+W，
+        # 而是销毁这个已失去基准页的浏览器窗口，再从微信主窗口恢复一个干净的搜一搜页。
+        search_window = recreate_sogou_search_window(
+            search_window,
+            account_name,
+            "遍历现有标签后未找到真正的搜一搜结果页",
+        )
+        if not find_and_pin_search_tab(search_window, account_name, max_tabs=3):
+            raise RuntimeError("重新创建搜一搜窗口后仍无法确认搜索页，为保护页面拒绝自动关闭标签")
+        log_event(
+            "article_tab_cleanup_search_recovered",
+            account=account_name,
+            recovered_hwnd=search_window.hwnd,
+        )
     closed = keep_only_search_tab(search_window, account_name)
     log_event(
         "article_tabs_closed",
@@ -502,6 +866,87 @@ def close_article_tabs_until_search(account_name: str) -> None:
         closed=closed,
         search_tab_preserved=True,
     )
+
+
+def close_current_article_tab(
+    account_name: str,
+    title: str = "",
+) -> bool:
+    """正常路径直接关闭当前文章标签，避免每篇文章都轮询全部标签。
+
+    文章采集结束时，前台应当仍是刚打开的文章标签。先确认它不是搜一搜
+    页面，再发送一次 Ctrl+W；只有关闭后仍无法确认回到搜一搜时，调用方
+    才会进入全量标签恢复流程。
+    """
+    try:
+        article_hwnd, article_rect = find_article_window()
+        foreground_hwnd = int(user32.GetForegroundWindow())
+        if foreground_hwnd != article_hwnd:
+            log_event(
+                "article_tab_direct_close_skipped",
+                account=account_name,
+                title=title,
+                reason="article_browser_not_foreground",
+                foreground_hwnd=foreground_hwnd,
+                article_hwnd=article_hwnd,
+            )
+            return False
+
+        # 防止异常流程没有真正打开文章时误关搜一搜标签。
+        evidence = _inspect_sogou_search_results(capture_window(article_rect))
+        if evidence.get("found"):
+            log_event(
+                "article_tab_direct_close_skipped",
+                account=account_name,
+                title=title,
+                reason="current_tab_is_search_page",
+            )
+            return False
+
+        press_ctrl_w()
+        time.sleep(0.45)
+        search_window = find_sogou_search_window()
+        search_evidence = _inspect_sogou_search_results(
+            capture_window(search_window.rect)
+        )
+        if not search_evidence.get("found"):
+            log_event(
+                "article_tab_direct_close_failed",
+                account=account_name,
+                title=title,
+                reason="search_page_not_confirmed_after_close",
+            )
+            return False
+        log_event(
+            "article_tab_closed_directly",
+            account=account_name,
+            title=title,
+            search_tab_preserved=True,
+        )
+        return True
+    except Exception as exc:
+        # 直接关闭只是一条快速路径，任何不确定都交给安全恢复流程。
+        log_event(
+            "article_tab_direct_close_failed",
+            account=account_name,
+            title=title,
+            reason="direct_close_exception",
+            error=str(exc),
+        )
+        return False
+
+
+def close_article_after_attempt(account_name: str, title: str = "") -> None:
+    """优先关闭当前文章，失败时才执行全量标签恢复。"""
+    if close_current_article_tab(account_name, title):
+        return
+    log_event(
+        "article_tab_cleanup_recovery_started",
+        account=account_name,
+        title=title,
+        reason="direct_close_not_confirmed",
+    )
+    close_article_tabs_until_search(account_name)
 
 
 def arrange_automation_window(window: WindowInfo, role: str) -> WindowInfo:
@@ -616,6 +1061,24 @@ def press_ctrl_1() -> None:
     user32.keybd_event(0x11, 0, 0x0002, 0)
 
 
+def press_ctrl_9() -> None:
+    """切换到浏览器最右侧标签，用于从尾部逐个清理文章页。"""
+    user32.keybd_event(0x11, 0, 0, 0)
+    user32.keybd_event(0x39, 0, 0, 0)
+    user32.keybd_event(0x39, 0, 0x0002, 0)
+    user32.keybd_event(0x11, 0, 0x0002, 0)
+
+
+def press_ctrl_shift_pageup() -> None:
+    """将当前 Chromium 标签向左移动一格，用于动态固定搜一搜标签。"""
+    user32.keybd_event(0x11, 0, 0, 0)
+    user32.keybd_event(0x10, 0, 0, 0)
+    user32.keybd_event(0x21, 0, 0, 0)
+    user32.keybd_event(0x21, 0, 0x0002, 0)
+    user32.keybd_event(0x10, 0, 0x0002, 0)
+    user32.keybd_event(0x11, 0, 0x0002, 0)
+
+
 def press_ctrl_a() -> None:
     user32.keybd_event(0x11, 0, 0, 0)
     user32.keybd_event(0x41, 0, 0, 0)
@@ -707,83 +1170,198 @@ def copy_article_url(
     rect: Rect,
     output_dir: Path | None = None,
     phase: str = "before",
+    client: QwenVisionClient | None = None,
+    allow_vl: bool = True,
 ) -> str:
-    """通过文章浏览器菜单复制链接，并用 OCR 适配不同窗口尺寸。"""
+    """动态定位浏览器菜单与“复制链接”，并用剪贴板 URL 验证整条操作链。"""
     clipboard_sentinel = f"__WECHAT_RPA_COPY_PENDING_{phase}__"
-    set_clipboard_text(clipboard_sentinel)
-    # 先关闭上一次失败后可能残留的菜单，再重新打开右上角菜单。
-    press_escape()
-    time.sleep(0.2)
     # 标题栏按钮的物理像素会随 Windows DPI 缩放：100% 时菜单距右侧约 124px，
     # 150% 时约 186px。使用窗口真实 DPI，避免把 150% 坐标误用到 100% 电脑。
     get_dpi_for_window = getattr(user32, "GetDpiForWindow", None)
     dpi = int(get_dpi_for_window(hwnd)) if get_dpi_for_window else 96
     dpi = dpi if dpi > 0 else 96
     scale = dpi / 96
-    menu_x = rect.right - round(124 * scale)
-    menu_y = rect.top + round(21 * scale)
-    click(menu_x, menu_y)
-    log_event(
-        "copy_link_menu_button_clicked",
-        phase=phase,
-        dpi=dpi,
-        scale=round(scale, 3),
-        screen_x=menu_x,
-        screen_y=menu_y,
-    )
-    time.sleep(0.8)
+    fallback_menu_action = {
+        "found": True,
+        "center_x_1000": round((rect.width - 124 * scale) * 1000 / rect.width),
+        "center_y_1000": round(21 * scale * 1000 / rect.height),
+        "confidence": 0.35,
+        "method": "dpi-relative-menu-button-fallback",
+    }
 
-    # 菜单布局稳定时先走固定坐标快速路径；剪贴板未得到 URL 时再回退 OCR。
-    # 坐标使用窗口相对比例，兼容窗口移动和 DPI 缩放。
-    fast_x = rect.left + round(rect.width * 0.718)
-    fast_y = rect.top + round(rect.height * 0.068)
-    click(fast_x, fast_y)
-    fast_deadline = time.monotonic() + 1.2
-    while time.monotonic() < fast_deadline:
-        time.sleep(0.12)
-        fast_url = read_clipboard_text().strip()
-        if fast_url.startswith("https://mp.weixin.qq.com/"):
-            log_event(
-                "copy_link_fast_path_succeeded",
-                phase=phase,
-                screen_x=fast_x,
-                screen_y=fast_y,
-            )
-            return fast_url
-
-    # 快速路径失败后重新打开菜单，再使用 OCR 精确定位“复制链接”。
+    # 先在菜单关闭状态下识别标题栏按钮，避免菜单遮罩干扰三点图标检测。
     press_escape()
-    click(menu_x, menu_y)
-    time.sleep(0.5)
-    menu_screenshot = capture_window(rect)
-    if output_dir is not None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        menu_screenshot.save(output_dir / f"copy-menu-{phase}.png")
-    action = PROFILE_OCR.locate_copy_link_action(menu_screenshot)
-    log_event("copy_link_menu_detection", phase=phase, **action)
-    if action.get("found"):
-        click(
-            rect.left + round(rect.width * int(action["center_x_1000"]) / 1000),
-            rect.top + round(rect.height * int(action["center_y_1000"]) / 1000),
+    time.sleep(0.2)
+    titlebar_screenshot = capture_window(rect)
+    menu_button_action: dict[str, Any] | None = None
+    cached_menu_button = load_menu_button_position_cache(rect, dpi)
+    if cached_menu_button is not None:
+        validated_menu_button = validate_cached_menu_button_action(
+            titlebar_screenshot,
+            cached_menu_button,
         )
-    else:
-        # OCR 极端情况下失效时保留按 DPI 缩放的旧版菜单项坐标作为最后兜底。
-        click(rect.right - round(303 * scale), rect.top + round(93 * scale))
-        click(rect.right - round(303 * scale), rect.top + round(93 * scale))
+        log_event("menu_button_cached_position_validation", phase=phase, **validated_menu_button)
+        if validated_menu_button.get("found"):
+            menu_button_action = validated_menu_button
+        else:
+            clear_menu_button_position_cache(
+                str(validated_menu_button.get("reason") or "缓存菜单按钮验证失败")
+            )
 
-    deadline = time.monotonic() + 2.5
-    url = ""
-    while time.monotonic() < deadline:
+    if menu_button_action is None:
+        local_menu_button = PROFILE_OCR.locate_browser_menu_button(titlebar_screenshot)
+        log_event("menu_button_local_detection", phase=phase, **local_menu_button)
+        if local_menu_button.get("found"):
+            menu_button_action = local_menu_button
+
+    if menu_button_action is None and allow_vl and client is not None:
+        try:
+            qwen_menu_button = normalize_qwen_menu_button_action(
+                client.detect_browser_menu_button(titlebar_screenshot)
+            )
+        except Exception as exc:
+            qwen_menu_button = {"found": False, "reason": f"Qwen-VL 菜单按钮定位失败：{exc}"}
+        log_event("menu_button_qwen_fallback", phase=phase, **qwen_menu_button)
+        if qwen_menu_button.get("found"):
+            menu_button_action = qwen_menu_button
+
+    if menu_button_action is None:
+        # 最终兜底仍是 DPI 相对位置，但只有后续成功复制出公众号 URL 时才会写入缓存。
+        menu_button_action = fallback_menu_action
+        log_event("menu_button_dpi_fallback", phase=phase, **fallback_menu_action)
+
+    def open_menu(stage: str) -> Image.Image:
+        # Esc 同时负责收起旧菜单和误弹出的“发送给”窗口，再打开干净菜单。
+        press_escape()
         time.sleep(0.2)
-        url = read_clipboard_text().strip()
-        if url != clipboard_sentinel:
-            break
-    if not url.startswith("https://mp.weixin.qq.com/"):
-        raise RuntimeError(
-            "复制链接失败，浏览器菜单未写入公众号URL："
-            f"menu_found={bool(action.get('found'))}，clipboard={url[:80]!r}"
+        menu_x = rect.left + round(
+            rect.width * int(menu_button_action["center_x_1000"]) / 1000
         )
-    return url
+        menu_y = rect.top + round(
+            rect.height * int(menu_button_action["center_y_1000"]) / 1000
+        )
+        click(menu_x, menu_y)
+        log_event(
+            "copy_link_menu_button_clicked",
+            phase=phase,
+            stage=stage,
+            dpi=dpi,
+            scale=round(scale, 3),
+            screen_x=menu_x,
+            screen_y=menu_y,
+            method=str(menu_button_action.get("method") or "unknown"),
+        )
+        time.sleep(0.8)
+        screenshot = capture_window(rect)
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            screenshot.save(output_dir / f"copy-menu-{phase}-{stage}.png")
+        return screenshot
+
+    def click_action(action: dict[str, Any], stage: str) -> str:
+        set_clipboard_text(clipboard_sentinel)
+        action_x = rect.left + round(rect.width * int(action["center_x_1000"]) / 1000)
+        action_y = rect.top + round(rect.height * int(action["center_y_1000"]) / 1000)
+        click(action_x, action_y)
+        log_event(
+            "copy_link_action_clicked",
+            phase=phase,
+            stage=stage,
+            screen_x=action_x,
+            screen_y=action_y,
+            method=str(action.get("method") or stage),
+        )
+        deadline = time.monotonic() + 2.5
+        observed = clipboard_sentinel
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            observed = read_clipboard_text().strip()
+            if observed != clipboard_sentinel:
+                break
+        log_event(
+            "copy_link_clipboard_validation",
+            phase=phase,
+            stage=stage,
+            valid=observed.startswith("https://mp.weixin.qq.com/"),
+        )
+        return observed
+
+    def remember_success(action: dict[str, Any], source: str) -> None:
+        """只有剪贴板 URL 已验证成功，才同时学习按钮与菜单项坐标。"""
+        save_copy_link_position_cache(action, rect, dpi, source)
+        save_menu_button_position_cache(
+            menu_button_action,
+            rect,
+            dpi,
+            str(menu_button_action.get("method") or "unknown"),
+        )
+
+    last_action: dict[str, Any] = {"found": False, "reason": "尚未识别菜单"}
+    last_url = clipboard_sentinel
+    menu_screenshot = open_menu("cache")
+
+    cached = load_copy_link_position_cache(rect, dpi)
+    if cached is not None:
+        cached_action = validate_cached_copy_link_action(menu_screenshot, cached)
+        last_action = cached_action
+        log_event("copy_link_cached_position_validation", phase=phase, **cached_action)
+        if cached_action.get("found"):
+            last_url = click_action(cached_action, "cache")
+            if last_url.startswith("https://mp.weixin.qq.com/"):
+                remember_success(cached_action, "cache-validated")
+                return last_url
+            clear_copy_link_position_cache("缓存坐标点击后剪贴板未得到公众号 URL")
+            menu_screenshot = open_menu("local-ocr")
+        else:
+            clear_copy_link_position_cache("缓存坐标附近未识别到复制链接")
+    else:
+        log_event("copy_link_cached_position_missed", phase=phase)
+
+    local_action = PROFILE_OCR.locate_copy_link_action(menu_screenshot)
+    last_action = local_action
+    log_event("copy_link_menu_detection", phase=phase, stage="local-ocr", **local_action)
+    if local_action.get("found"):
+        last_url = click_action(local_action, "local-ocr")
+        if last_url.startswith("https://mp.weixin.qq.com/"):
+            remember_success(local_action, "local-ocr")
+            return last_url
+        menu_screenshot = open_menu("qwen-vl")
+    else:
+        log_event(
+            "copy_link_menu_action_skipped",
+            phase=phase,
+            stage="local-ocr",
+            reason=str(local_action.get("reason") or "未找到复制链接菜单项"),
+        )
+
+    if allow_vl and client is not None:
+        try:
+            qwen_action = normalize_qwen_copy_link_action(
+                client.detect_copy_link_action(menu_screenshot)
+            )
+        except Exception as exc:
+            qwen_action = {"found": False, "reason": f"Qwen-VL 调用失败：{exc}"}
+        last_action = qwen_action
+        log_event("copy_link_qwen_fallback", phase=phase, **qwen_action)
+        if qwen_action.get("found"):
+            last_url = click_action(qwen_action, "qwen-vl")
+            if last_url.startswith("https://mp.weixin.qq.com/"):
+                remember_success(qwen_action, "qwen-vl")
+                return last_url
+    else:
+        log_event(
+            "copy_link_qwen_fallback_skipped",
+            phase=phase,
+            reason="VL 已禁用或客户端未配置",
+        )
+
+    clear_copy_link_position_cache("复制链接三层识别全部失败")
+    clear_menu_button_position_cache("未能通过合法公众号 URL 验证菜单按钮")
+    press_escape()
+    raise RuntimeError(
+        "复制链接失败，缓存坐标、本地 OCR 与 Qwen-VL 均未写入公众号URL："
+        f"menu_found={bool(last_action.get('found'))}，clipboard={last_url[:80]!r}"
+    )
 
 
 class ArticleMismatchError(RuntimeError):
@@ -816,6 +1394,7 @@ def canonical_title_for_match(value: str) -> str:
         compact.replace("OpenAl", "OpenAI")
         .replace("ChatGPt", "ChatGPT")
         .replace("AlAgent", "AIAgent")
+        .replace("PhysicalAl", "PhysicalAI")
     )
 
 
@@ -828,11 +1407,15 @@ def titles_match(expected: str, actual: str) -> bool:
     if expected_value.endswith(("...", "…")):
         truncated_canonical = canonical_title_for_match(truncated)
         # 卡片文本带省略号时，卡片只提供标题前缀；以去标点后的前缀比较，
-        # 能兼容“丨 / |”等 OCR 差异，公众号名和文章 URL 仍会独立校验。
-        return (
-            len(truncated_canonical) >= 8
-            and actual_canonical.startswith(truncated_canonical)
-        )
+        # 能兼容“丨 / |”以及极少量 OCR 错字；公众号名和文章 URL 仍会独立校验。
+        if len(truncated_canonical) < 8:
+            return False
+        if actual_canonical.startswith(truncated_canonical):
+            return True
+        actual_prefix = actual_canonical[: len(truncated_canonical)]
+        return difflib.SequenceMatcher(
+            None, truncated_canonical, actual_prefix
+        ).ratio() >= 0.90
     if expected_value == actual_value:
         return True
     if expected_canonical == actual_canonical:
@@ -920,6 +1503,7 @@ def collect_open_article(
     list_like_count: int | None = None,
     successful_urls_in_run: set[str] | None = None,
     metric_mode: str = "all",
+    scan_range: str | None = None,
 ) -> dict[str, Any]:
     log_event(
         "article_collect_started",
@@ -940,7 +1524,14 @@ def collect_open_article(
         rect={"left": rect.left, "top": rect.top, "width": rect.width, "height": rect.height},
     )
     # 先复制链接并解析真实标题，校验通过后直接识别固定在视口底部的互动栏。
-    url = copy_article_url(hwnd, rect, output_dir, "before")
+    url = copy_article_url(
+        hwnd,
+        rect,
+        output_dir,
+        "before",
+        client=client,
+        allow_vl=allow_vl,
+    )
     log_event("article_url_copied_before", url=url)
     if successful_urls_in_run is not None and url in successful_urls_in_run:
         # URL 是文章的确定标识；仅凭 OCR 标题相似度绝不跳过，避免误漏文章。
@@ -957,7 +1548,7 @@ def collect_open_article(
         try:
             cached_page = load_cached_page(
                 url,
-                mongo_uri or os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017/"),
+                mongo_uri or os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/"),
                 mongo_database or os.getenv("MONGO_DATABASE", "weixin"),
                 mongo_collection or os.getenv("MONGO_ARTICLE_COLLECTION", "article"),
             )
@@ -982,6 +1573,25 @@ def collect_open_article(
         raise ArticleMismatchError(
             f"公众号不匹配：目标={expected_account!r}，实际={page['account_name']!r}"
         )
+    publish_time = page.get("publish_time") or page.get("publishDate")
+    if scan_range and not publish_time_matches_scan_range(publish_time, scan_range):
+        # 资料页时间分组只用于初筛；真正写库前必须以文章页面的发布时间为准。
+        # 这样即使 OCR 把旧卡片错误归到“今天”，也不会更新历史文章互动数。
+        log_event(
+            "article_skipped_outside_scan_range",
+            url=url,
+            title=page.get("title"),
+            publish_time=publish_time,
+            scan_range=scan_range,
+        )
+        return {
+            "url": url,
+            "title": page.get("title") or expected_title or "",
+            "account_name": page.get("account_name") or expected_account or "",
+            "publish_time": publish_time,
+            "status": "skipped_outside_scan_range",
+            "skip_reason": f"真实发布时间 {publish_time} 不属于扫描范围 {scan_range}",
+        }
     evidence_screenshot = capture_window(rect)
     evidence_screenshot.save(output_dir / "article_evidence.png")
     evidence = ARTICLE_EVIDENCE_OCR.inspect(evidence_screenshot, page["title"])
@@ -1060,7 +1670,14 @@ def collect_open_article(
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    url_after = copy_article_url(hwnd, rect, output_dir, "after")
+    url_after = copy_article_url(
+        hwnd,
+        rect,
+        output_dir,
+        "after",
+        client=client,
+        allow_vl=allow_vl,
+    )
     log_event("article_url_copied_after", url_before=url, url_after=url_after, stable=url_after == url)
     if url_after != url:
         raise ArticleMismatchError(
@@ -1085,7 +1702,7 @@ def collect_open_article(
     result = ingest(
         url=url,
         metrics=metrics,
-        mongo_uri=mongo_uri or os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017/"),
+        mongo_uri=mongo_uri or os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/"),
         database_name=mongo_database or os.getenv("MONGO_DATABASE", "weixin"),
         collection_name=mongo_collection or os.getenv("MONGO_ARTICLE_COLLECTION", "article"),
         dry_run=not write_mongo,
@@ -1182,6 +1799,7 @@ def run_one_account(
         selected_result["articles"], scan_range
     )[:max_articles]
     collected: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
     failures: list[dict[str, str]] = []
     for index, article in enumerate(articles, start=1):
         try:
@@ -1195,8 +1813,17 @@ def run_one_account(
                 export_jsonl=export_jsonl,
                 export_csv=export_csv,
                 metric_mode=metric_mode,
+                scan_range=scan_range,
             )
-            collected.append({key: value for key, value in record.items() if key != "content"})
+            if record.get("status") == "skipped_outside_scan_range":
+                skipped.append(
+                    {
+                        "title": article.get("title", ""),
+                        "reason": str(record.get("skip_reason") or "真实发布时间不在扫描范围"),
+                    }
+                )
+            else:
+                collected.append({key: value for key, value in record.items() if key != "content"})
         except Exception as exc:
             failures.append({"title": article.get("title", ""), "error": str(exc)})
         finally:
@@ -1214,6 +1841,7 @@ def run_one_account(
         "account": account.get("name"),
         "recognized_recent_articles": len(articles),
         "collected": collected,
+        "skipped": skipped,
         "failures": failures,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1340,6 +1968,27 @@ def _normalize_account_name_for_confirmation(value: object) -> str:
     return "".join(unicodedata.normalize("NFKC", str(value or "")).split()).casefold()
 
 
+def _qwen_profile_header_confirmed(
+    validation: dict[str, Any], expected_name: str
+) -> bool:
+    """只依据模型读到的精确名称和置信度确认资料页。
+
+    部分兼容网关会返回正确的 ``name``，但把派生字段 ``matched`` 错置为 false。
+    名称仍必须精确一致，并要求足够置信度；因此不会放宽到相似公众号。
+    """
+    observed_name = str(validation.get("name") or "").strip()
+    try:
+        confidence = float(validation.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return (
+        bool(observed_name)
+        and confidence >= 0.80
+        and _normalize_account_name_for_confirmation(observed_name)
+        == _normalize_account_name_for_confirmation(expected_name)
+    )
+
+
 def _qwen_search_target(
     client: QwenVisionClient,
     screenshot: Image.Image,
@@ -1429,7 +2078,7 @@ def search_and_open_profile(
         )
     search_window = arrange_automation_window(search_window, "browser")
     activate_window(search_window.hwnd)
-    # 搜一搜固定保存在第一个标签；异常中断后先回到首标签，避免把残留文章页当搜索页。
+    # 正常情况下搜一搜位于首标签；若远端电脑曾中断或人工改过标签顺序，先动态找回并归位。
     press_ctrl_1()
     time.sleep(0.6)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1450,7 +2099,15 @@ def search_and_open_profile(
         if search_box.get("found"):
             break
         if recovery_index == 1 and not search_page_recreated:
-            # 首标签仍没有搜索框，说明搜一搜页已被文章标签替代；不能再原地等待。
+            if find_and_pin_search_tab(search_window, account_name):
+                log_event(
+                    "search_page_recovery_finished",
+                    account=account_name,
+                    recovered_hwnd=search_window.hwnd,
+                    method="existing-tab-scan",
+                )
+                continue
+            # 所有现有标签都不是搜一搜，才从微信主窗口重建，避免无谓关闭整个浏览器。
             search_window = recreate_sogou_search_window(
                 search_window,
                 account_name,
@@ -1715,13 +2372,11 @@ def search_and_open_profile(
                 try:
                     vl_validation = client.verify_profile_header(header_image, search_name)
                     observed_name = str(vl_validation.get("name") or "").strip()
-                    if not vl_validation.get("matched") or (
-                        _normalize_account_name_for_confirmation(observed_name)
-                        != _normalize_account_name_for_confirmation(search_name)
-                    ):
+                    if not _qwen_profile_header_confirmed(vl_validation, search_name):
                         raise ValueError(
                             "Qwen-VL 未确认资料窗口名称："
-                            f"预期={search_name!r}，识别={observed_name!r}"
+                            f"预期={search_name!r}，识别={observed_name!r}，"
+                            f"置信度={vl_validation.get('confidence')!r}"
                         )
                     (output_dir / "profile-validation-qwen.json").write_text(
                         json.dumps(vl_validation, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1732,6 +2387,7 @@ def search_and_open_profile(
                         account=account_name,
                         matched_name=observed_name,
                         confidence=vl_validation.get("confidence"),
+                        model_matched=vl_validation.get("matched"),
                     )
                     return profile, observed_name
                 except Exception as exc:
@@ -2015,6 +2671,25 @@ def is_recent_time_group(value: str, scan_range: str = "today_yesterday") -> boo
     )
 
 
+def publish_time_matches_scan_range(
+    value: Any,
+    scan_range: str,
+    *,
+    reference_date: date | None = None,
+) -> bool:
+    """按北京时间复核文章真实发布时间是否属于本次任务范围。"""
+    if scan_range not in {"today", "yesterday", "today_yesterday"}:
+        raise ValueError(f"未知扫描范围：{scan_range}")
+    publish_value = value if isinstance(value, datetime) else parse_publish_time(str(value or ""))
+    publish_date = publish_value.date()
+    today = reference_date or datetime.now(shanghai_timezone()).date()
+    if scan_range == "today":
+        return publish_date == today
+    if scan_range == "yesterday":
+        return publish_date == today - timedelta(days=1)
+    return publish_date in {today, today - timedelta(days=1)}
+
+
 def build_card_signature(
     time_group: str, article: dict[str, Any]
 ) -> tuple[str, str, int, int] | None:
@@ -2026,6 +2701,13 @@ def build_card_signature(
     if not title or not group or not isinstance(read_count, int) or not isinstance(like_count, int):
         return None
     return group, title, read_count, like_count
+
+
+def build_card_title_signature(time_group: str, article: dict[str, Any]) -> tuple[str, str] | None:
+    """生成本轮终态去重指纹；互动数缺失时仍可阻止同一卡片重复打开。"""
+    title = normalize_title(str(article.get("title") or ""))
+    group = normalize_title(time_group)
+    return (group, title) if group and title else None
 
 
 def collect_searched_account(
@@ -2145,7 +2827,17 @@ def collect_searched_account(
                             mongo_collection=mongo_collection,
                             mongo_target_collection=mongo_target_collection,
                             metric_mode=metric_mode,
+                            scan_range=scan_range,
                         )
+                        if record.get("status") == "skipped_outside_scan_range":
+                            skipped.append(
+                                {
+                                    "title": title,
+                                    "reason": str(record.get("skip_reason") or "真实发布时间不在扫描范围"),
+                                    "url": str(record.get("url") or ""),
+                                }
+                            )
+                            break
                         collected.append(
                             {key: value for key, value in record.items() if key != "content"}
                         )
@@ -2165,8 +2857,19 @@ def collect_searched_account(
                             activate_window(article_hwnd)
                             press_ctrl_w()
                             time.sleep(0.8)
-                        except Exception:
-                            pass
+                        except Exception as cleanup_exc:
+                            log_event(
+                                "article_tab_cleanup_failed",
+                                account=account_name,
+                                title=title,
+                                attempt=attempt,
+                                error=str(cleanup_exc),
+                                action="abort_account_to_prevent_tab_accumulation",
+                            )
+                            raise RuntimeError(
+                                "文章标签关闭失败，为避免重复打开和数据错配，已停止当前公众号采集："
+                                f"{cleanup_exc}"
+                            ) from cleanup_exc
                 else:
                     failure = {
                         "account": account_name,
@@ -2237,7 +2940,9 @@ def collect_profile_account(
     )
     """从搜一搜进入公众号资料窗口，采集今天和昨天的文章。"""
     profile_window: WindowInfo | None = None
-    matched_account_name = account_name
+    # 数据库中的账号名是文章归属的唯一标准。搜一搜 OCR 读到的名称可能会
+    # 带上“媒体”“官方”等身份后缀，只能用于搜索结果校验，不能污染文章页校验。
+    observed_account_name = account_name
     collected: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
@@ -2245,8 +2950,11 @@ def collect_profile_account(
     current_group = ""
     # 卡片指纹仅在成功后登记；URL 仍作为打开文章后的最终精确去重依据。
     successful_card_signatures: set[tuple[str, str, int, int]] = set()
+    # 同一标题卡片无论成功、跳过还是三次失败，达到终态后本轮都不再重复打开。
+    terminal_card_title_signatures: set[tuple[str, str]] = set()
     successful_urls: set[str] = set()
     skipped_card_duplicate_count = 0
+    skipped_terminal_duplicate_count = 0
     skipped_url_duplicate_count = 0
     observed_card_count = 0
     out_of_range_card_count = 0
@@ -2260,12 +2968,42 @@ def collect_profile_account(
         else None
     )
     stop_reason = "达到最大翻页数"
+    partial_summary_path = output_dir / "partial-summary.json"
+
+    def write_partial_checkpoint() -> None:
+        """逐篇保存账号进度，避免后续窗口清理失败掩盖已成功结果。"""
+        checkpoint = {
+            "account": account_name,
+            "discovery_mode": "sogou-profile",
+            "partial": True,
+            "detected_articles": detected_count,
+            "stop_reason": "账号仍在采集，已保存成功文章检查点",
+            "scan": {
+                "range": scan_range,
+                "observed_cards": observed_card_count,
+                "eligible_cards": detected_count,
+                "outside_range_cards": out_of_range_card_count,
+                "ungrouped_cards": ungrouped_card_count,
+                "promotion_cards": promotion_card_count,
+            },
+            "collected": collected,
+            "skipped": skipped,
+            "failures": failures,
+        }
+        output_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = partial_summary_path.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps(checkpoint, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        temporary_path.replace(partial_summary_path)
+
     try:
         search_error = ""
         for attempt in range(1, 4):
             try:
                 log_event("account_search_attempt", account=account_name, attempt=attempt)
-                profile_window, matched_account_name = search_and_open_profile(
+                profile_window, observed_account_name = search_and_open_profile(
                     account_name,
                     output_dir / "search" / f"attempt-{attempt}",
                     client=client,
@@ -2278,6 +3016,12 @@ def collect_profile_account(
                 time.sleep(0.8)
         if profile_window is None:
             raise RuntimeError(f"搜一搜连续3次打开公众号失败：{search_error}")
+        # 记录 OCR 看到的结果名，但后续文章归属仍使用 account_name。
+        log_event(
+            "account_identity_observed",
+            account=account_name,
+            observed_name=observed_account_name,
+        )
 
         for page_index in range(1, 13):
             if deadline is not None and time.monotonic() >= deadline:
@@ -2333,6 +3077,22 @@ def collect_profile_account(
                     skipped.append({"title": title, "reason": reason})
                     continue
                 card_signature = build_card_signature(current_group, event)
+                title_signature = build_card_title_signature(current_group, event)
+                if title_signature is not None and title_signature in terminal_card_title_signatures:
+                    skipped_terminal_duplicate_count += 1
+                    skipped.append(
+                        {
+                            "title": title,
+                            "reason": "本次任务已处理过同一日期分组和标题，点击前跳过",
+                        }
+                    )
+                    log_event(
+                        "article_card_skipped_terminal_duplicate",
+                        account=account_name,
+                        title=title,
+                        time_group=current_group,
+                    )
+                    continue
                 if card_signature is not None and card_signature in successful_card_signatures:
                     skipped_card_duplicate_count += 1
                     skipped.append(
@@ -2371,7 +3131,9 @@ def collect_profile_account(
                             export_jsonl=export_jsonl,
                             export_csv=export_csv,
                             expected_title=title,
-                            expected_account=matched_account_name,
+                            # 文章页和 MongoDB 始终按数据库标准账号名校验；OCR 搜索结果
+                            # 中的附加后缀仅保留在搜索日志中，不作为文章归属名。
+                            expected_account=account_name,
                             allow_vl=allow_vl,
                             mongo_uri=mongo_uri,
                             mongo_database=mongo_database,
@@ -2381,7 +3143,26 @@ def collect_profile_account(
                             list_like_count=event.get("list_like_count"),
                             successful_urls_in_run=successful_urls,
                             metric_mode=metric_mode,
+                            scan_range=scan_range,
                         )
+                        if record.get("status") == "skipped_outside_scan_range":
+                            skipped.append(
+                                {
+                                    "title": title,
+                                    "reason": str(record.get("skip_reason") or "真实发布时间不在扫描范围"),
+                                    "url": str(record.get("url") or ""),
+                                }
+                            )
+                            if title_signature is not None:
+                                terminal_card_title_signatures.add(title_signature)
+                            log_event(
+                                "article_attempt_skipped_outside_scan_range",
+                                account=account_name,
+                                title=title,
+                                publish_time=record.get("publish_time"),
+                                scan_range=scan_range,
+                            )
+                            break
                         if record.get("status") == "skipped_duplicate_in_run":
                             skipped_url_duplicate_count += 1
                             skipped.append(
@@ -2392,6 +3173,8 @@ def collect_profile_account(
                                 }
                             )
                             log_event("article_attempt_duplicate_url", account=account_name, title=title, url=record.get("url"))
+                            if title_signature is not None:
+                                terminal_card_title_signatures.add(title_signature)
                             break
                         collected.append(
                             {key: value for key, value in record.items() if key != "content"}
@@ -2401,6 +3184,8 @@ def collect_profile_account(
                             successful_urls.add(successful_url)
                         if card_signature is not None:
                             successful_card_signatures.add(card_signature)
+                        if title_signature is not None:
+                            terminal_card_title_signatures.add(title_signature)
                         processed_count += 1
                         log_event(
                             "article_collect_succeeded",
@@ -2409,6 +3194,7 @@ def collect_profile_account(
                             url=successful_url,
                             processed_count=processed_count,
                         )
+                        write_partial_checkpoint()
                         break
                     except Exception as exc:
                         last_error = str(exc)
@@ -2425,14 +3211,21 @@ def collect_profile_account(
                         )
                     finally:
                         try:
-                            close_article_tabs_until_search(account_name)
+                            close_article_after_attempt(account_name, title)
                         except Exception as cleanup_exc:
                             log_event(
                                 "article_tab_cleanup_failed",
                                 account=account_name,
                                 title=title,
                                 error=str(cleanup_exc),
+                                action="abort_account_to_prevent_tab_accumulation",
                             )
+                            # 标签页数量是采集正确性的硬约束。清理失败后继续点击会让旧文章成为活动页，
+                            # 造成标题、链接和互动数错配，因此宁可停止当前公众号也不能继续累积标签。
+                            raise RuntimeError(
+                                "文章标签清理失败，为避免旧标签累积和文章数据错配，"
+                                f"已停止当前公众号采集：{cleanup_exc}"
+                            ) from cleanup_exc
                 else:
                     failure = {
                         "account": account_name,
@@ -2443,6 +3236,8 @@ def collect_profile_account(
                     }
                     failures.append(failure)
                     append_failure_queue(output_dir, failure)
+                    if title_signature is not None:
+                        terminal_card_title_signatures.add(title_signature)
 
             if processed_count >= max_articles:
                 stop_reason = f"达到文章上限 {max_articles}"
@@ -2472,8 +3267,10 @@ def collect_profile_account(
         },
         "dedupe": {
             "successful_card_signatures_in_run": len(successful_card_signatures),
+            "terminal_card_title_signatures_in_run": len(terminal_card_title_signatures),
             "successful_urls_in_run": len(successful_urls),
             "skipped_card_duplicate_before_click": skipped_card_duplicate_count,
+            "skipped_terminal_duplicate_before_click": skipped_terminal_duplicate_count,
             "skipped_url_duplicate_after_open": skipped_url_duplicate_count,
         },
         "collected": collected,
@@ -2484,8 +3281,58 @@ def collect_profile_account(
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
+    partial_summary_path.unlink(missing_ok=True)
     log_event("account_collection_finished", **summary)
     return summary
+
+
+def recover_partial_account_summary(
+    output_dir: Path,
+    account_name: str,
+    error: str,
+    category: str,
+) -> dict[str, Any]:
+    """将账号异常前的逐篇检查点合并到最终失败摘要。"""
+    fatal_summary: dict[str, Any] = {
+        "account": account_name,
+        "fatal_error": error,
+        "fatal_category": category,
+    }
+    partial_summary_path = output_dir / "partial-summary.json"
+    if not partial_summary_path.exists():
+        return fatal_summary
+    try:
+        recovered = json.loads(partial_summary_path.read_text(encoding="utf-8"))
+        if not isinstance(recovered, dict):
+            return fatal_summary
+        fatal_summary = recovered
+        fatal_summary.update(
+            {
+                "partial": True,
+                "fatal_error": error,
+                "fatal_category": category,
+                "stop_reason": "账号中途失败；已保留中断前成功采集的文章",
+            }
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "summary.json").write_text(
+            json.dumps(fatal_summary, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        log_event(
+            "account_partial_result_recovered",
+            account=account_name,
+            collected=len(fatal_summary.get("collected") or []),
+            fatal_error=error,
+            fatal_category=category,
+        )
+    except (OSError, ValueError, TypeError) as checkpoint_exc:
+        log_event(
+            "account_partial_result_recovery_failed",
+            account=account_name,
+            error=str(checkpoint_exc),
+        )
+    return fatal_summary
 
 
 def load_account_names(
@@ -2547,7 +3394,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--accounts-mongo-uri",
-        default=os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017/"),
+        default=os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/"),
     )
     parser.add_argument(
         "--accounts-mongo-database",
@@ -2586,7 +3433,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-mongo", action="store_true", help="允许将采集结果写入MongoDB")
     parser.add_argument(
         "--article-mongo-uri",
-        default=os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017/"),
+        default=os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/"),
     )
     parser.add_argument(
         "--article-mongo-database",
@@ -2616,8 +3463,16 @@ def main() -> None:
     if args.local_only:
         # 严格本地模式不要求配置 API Key，且所有可能调用 VL 的分支都会被禁止。
         client = QwenVisionClient(QwenVisionConfig(base_url="", api_key=""))
+        vl_available = False
     else:
-        client = QwenVisionClient(QwenVisionConfig.from_env())
+        try:
+            client = QwenVisionClient(QwenVisionConfig.from_env())
+            vl_available = True
+        except RuntimeError as exc:
+            # 未配置视觉模型时继续运行本地采集；真正进入兜底分支时会在日志中明确显示已跳过。
+            client = QwenVisionClient(QwenVisionConfig(base_url="", api_key=""))
+            vl_available = False
+            log_event("qwen_vl_unavailable", reason=str(exc))
     if args.run_search_accounts:
         if not args.live:
             raise RuntimeError("搜索采集模式必须显式传入 --live")
@@ -2656,6 +3511,7 @@ def main() -> None:
         )
         summaries = []
         for account_name in account_names:
+            account_output_dir = Path(args.output_dir) / safe_path_name(account_name)
             try:
                 collector = (
                     collect_profile_account
@@ -2665,11 +3521,11 @@ def main() -> None:
                 summaries.append(collector(
                     client,
                     account_name,
-                    Path(args.output_dir) / safe_path_name(account_name),
+                    account_output_dir,
                     args.max_articles,
                     args.export_jsonl or None,
                     args.export_csv or None,
-                    allow_vl=not args.local_only,
+                    allow_vl=vl_available,
                     write_mongo=args.write_mongo,
                     mongo_uri=args.article_mongo_uri,
                     mongo_database=args.article_mongo_database,
@@ -2681,23 +3537,51 @@ def main() -> None:
                 ))
             except Exception as exc:
                 error = str(exc)
+                category = classify_collection_error(exc)
                 # 账号级异常没有恢复机会，显式记录终态事件，供控制台准确统计。
                 log_event(
                     "account_collection_failed",
                     account=account_name,
                     error=error,
-                    category=classify_collection_error(exc),
+                    category=category,
                 )
-                summaries.append({"account": account_name, "fatal_error": error})
+                fatal_summary = recover_partial_account_summary(
+                    account_output_dir,
+                    account_name,
+                    error,
+                    category,
+                )
+                summaries.append(fatal_summary)
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         (Path(args.output_dir) / "batch-summary.json").write_text(
             json.dumps(summaries, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
         )
+        collected_records = [
+            record
+            for summary in summaries
+            for record in (summary.get("collected") or [])
+            if isinstance(record, dict)
+        ]
+        log_event(
+            "run_finished",
+            accounts_total=len(account_names),
+            accounts_failed=sum(1 for summary in summaries if summary.get("fatal_error")),
+            articles_collected=len(collected_records),
+            articles_inserted=sum(
+                1 for record in collected_records if record.get("status") == "inserted"
+            ),
+            articles_updated=sum(
+                1 for record in collected_records if record.get("status") == "updated"
+            ),
+            article_failures=sum(
+                len(summary.get("failures") or []) for summary in summaries
+            ),
+        )
         print(json.dumps(summaries, ensure_ascii=False, indent=2, default=str))
         return
     if args.run_one_account:
-        if args.local_only:
-            raise RuntimeError("--run-one-account 依赖旧版管理页VL定位，不支持 --local-only")
+        if not vl_available:
+            raise RuntimeError("--run-one-account 依赖视觉模型，请先配置 QWEN_VL_API_KEY")
         if not args.live:
             raise RuntimeError("公众号循环必须显式传入 --live")
         result = run_one_account(
@@ -2719,14 +3603,14 @@ def main() -> None:
             args.write_mongo,
             args.export_jsonl or None,
             args.export_csv or None,
-            allow_vl=not args.local_only,
+            allow_vl=vl_available,
             metric_mode=args.metrics,
         )
         summary = {key: value for key, value in result.items() if key != "content"}
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
         return
-    if args.local_only:
-        raise RuntimeError("--local-only 仅支持 --run-search-accounts 或 --collect-open-article")
+    if not vl_available:
+        raise RuntimeError("当前操作依赖视觉模型，请先配置 QWEN_VL_API_KEY")
     result = analyze_current_window(client, Path(args.output_dir))
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

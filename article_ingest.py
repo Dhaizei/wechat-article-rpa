@@ -415,7 +415,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
     parser.add_argument("--metrics-json", required=True)
-    parser.add_argument("--mongo-uri", default=os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017/"))
+    parser.add_argument("--mongo-uri", default=os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/"))
     parser.add_argument("--database", default=os.getenv("MONGO_DATABASE", "weixin"))
     parser.add_argument("--collection", default=os.getenv("MONGO_ARTICLE_COLLECTION", "article"))
     parser.add_argument("--dry-run", action="store_true")

@@ -46,6 +46,26 @@ class ControlPanelTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_run_status_reflects_business_failures_even_with_zero_exit_code(self) -> None:
+        """子进程正常退出不等于采集成功，全部账号失败时必须显示异常退出。"""
+        status, message = panel.determine_final_run_status(
+            exit_code=0,
+            manually_stopped=False,
+            summary={"accounts_failed": 69, "accounts_succeeded": 0, "accounts_no_updates": 0},
+        )
+
+        self.assertEqual(status, "failed")
+        self.assertIn("全部公众号", message)
+
+    def test_run_status_marks_mixed_results_as_partial(self) -> None:
+        status, _message = panel.determine_final_run_status(
+            exit_code=0,
+            manually_stopped=False,
+            summary={"accounts_failed": 2, "accounts_succeeded": 67, "accounts_no_updates": 0},
+        )
+
+        self.assertEqual(status, "partial")
+
     def test_history_marks_abandoned_running_record_as_interrupted(self) -> None:
         history_path = self.temp_path / "run_history.json"
         history = panel.RunHistory(history_path)
@@ -115,6 +135,12 @@ class ControlPanelTests(unittest.TestCase):
         self.assertEqual(command[command.index("--scan-range") + 1], "today")
         self.assertEqual(command[command.index("--metrics") + 1], "share")
         self.assertEqual(command[command.index("--max-articles") + 1], "7")
+        self.assertNotIn("--local-only", command)
+
+    def test_portable_start_script_does_not_disable_vl_fallback(self) -> None:
+        """便携启动脚本必须允许 .env 中配置的 Qwen-VL 在本地 OCR 失败后兜底。"""
+        script = (panel.RPA_DIR / "start-rpa.ps1").read_text(encoding="utf-8")
+        self.assertNotIn('"--local-only"', script)
 
     def test_schedule_ranges_keep_morning_and_evening_rules(self) -> None:
         """早晚任务必须各自携带范围，不能再被全局 scan_range 覆盖。"""

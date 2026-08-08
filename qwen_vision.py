@@ -12,6 +12,12 @@ from typing import Any
 import requests
 from PIL import Image
 
+from env_config import load_project_env
+
+
+# 允许解压后的便携项目直接使用根目录 .env；系统环境变量仍具有更高优先级。
+load_project_env()
+
 
 @dataclass(frozen=True)
 class QwenVisionConfig:
@@ -26,7 +32,7 @@ class QwenVisionConfig:
         if not api_key:
             raise RuntimeError("缺少环境变量 QWEN_VL_API_KEY")
         return cls(
-            base_url=os.getenv("QWEN_VL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/"),
+            base_url=os.getenv("QWEN_VL_BASE_URL", "http://192.168.33.27/v1").rstrip("/"),
             api_key=api_key,
             model=os.getenv("QWEN_VL_MODEL", "dashscope/qwen3-vl-plus"),
         )
@@ -208,3 +214,26 @@ Return ONLY valid JSON and use null for any value not clearly visible:
 "favorite_count":integer|null,"comment_count":integer|null}.
 The four icons from left to right are like, share, favorite, comment. Never guess."""
         return self.analyze(article_footer, prompt, max_tokens=500)
+
+    def detect_copy_link_action(self, browser_menu: Image.Image) -> dict[str, Any]:
+        """在浏览器菜单截图中定位“复制链接”，仅作为本地 OCR 失败后的兜底。"""
+        prompt = """This screenshot shows an opened menu in the WeChat article browser.
+Locate the menu item whose visible Chinese label is exactly 复制链接 (Copy link).
+Do not select 转发, 发送给, 收藏, or any other action. Return ONLY valid JSON:
+{"found":boolean,"label":string|null,"center_x_1000":integer|null,
+"center_y_1000":integer|null,"confidence":number}.
+Set found=true only when the exact 复制链接 label is visibly present. Coordinates are
+normalized integers from 0 to 1000 relative to the complete screenshot. Never guess."""
+        return self.analyze(browser_menu, prompt, max_tokens=350)
+
+    def detect_browser_menu_button(self, article_window: Image.Image) -> dict[str, Any]:
+        """定位文章浏览器标题栏右侧的三点菜单按钮，作为本地图像识别兜底。"""
+        prompt = """This is a complete WeChat article browser window before its menu is opened.
+Locate the browser toolbar's horizontal three-dot More menu button in the TOP TITLE BAR.
+Do not select Windows minimize, maximize, close controls, page content, article icons, or any
+other ellipsis. Return ONLY valid JSON:
+{"found":boolean,"label":string|null,"center_x_1000":integer|null,
+"center_y_1000":integer|null,"confidence":number}.
+Use label "..." when found. Coordinates are normalized relative to the complete screenshot.
+Set found=false when the title-bar button is not clearly visible. Never guess."""
+        return self.analyze(article_window, prompt, max_tokens=350)

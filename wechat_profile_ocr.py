@@ -7,6 +7,7 @@ import time
 import unicodedata
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image
 from rapidocr_onnxruntime import RapidOCR
@@ -184,6 +185,101 @@ class WeChatProfileOCR:
             "center_y_1000": round(row["center_y"] * 1000 / height),
             "confidence": row["confidence"],
             "method": "rapidocr-browser-copy-link",
+        }
+
+    def locate_browser_menu_button(self, screenshot: Image.Image) -> dict[str, Any]:
+        """通过标题栏中的三个横向圆点定位浏览器“更多”菜单按钮。
+
+        这里只分析截图顶部右半区，并要求三个小连通域水平对齐、间距接近，
+        避免把最小化、最大化或正文中的省略号当成菜单按钮。
+        """
+        rgb = np.asarray(screenshot.convert("RGB"))
+        height, width = rgb.shape[:2]
+        if width < 120 or height < 80:
+            return {"found": False, "reason": "文章窗口截图过小"}
+
+        # 只检查浏览器顶部工具栏。文章正文和网页工具栏也可能出现“...”，
+        # 如果把识别区域放到页面内容区，会误点网页自身的分享/更多按钮。
+        title_bottom = max(44, min(round(height * 0.06), 72))
+        search_left = round(width * 0.45)
+        search_right = round(width * 0.96)
+        gray = cv2.cvtColor(rgb[:title_bottom, search_left:search_right], cv2.COLOR_RGB2GRAY)
+        # 标题栏通常是浅色背景；较严格的深色阈值可排除大部分抗锯齿文字边缘。
+        mask = cv2.threshold(gray, 105, 255, cv2.THRESH_BINARY_INV)[1]
+        component_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+        dots: list[dict[str, float]] = []
+        max_dot_size = max(9, round(title_bottom * 0.18))
+        for index in range(1, component_count):
+            left, top, box_width, box_height, area = stats[index]
+            if not (1 <= area <= max_dot_size * max_dot_size):
+                continue
+            if not (1 <= box_width <= max_dot_size and 1 <= box_height <= max_dot_size):
+                continue
+            aspect = box_width / max(box_height, 1)
+            if not 0.45 <= aspect <= 2.2:
+                continue
+            center_x, center_y = centroids[index]
+            dots.append(
+                {
+                    "x": float(center_x),
+                    "y": float(center_y),
+                    "width": float(box_width),
+                    "height": float(box_height),
+                    "area": float(area),
+                }
+            )
+
+        best: tuple[float, dict[str, float], dict[str, float], dict[str, float]] | None = None
+        dots.sort(key=lambda item: item["x"])
+        for first_index in range(len(dots)):
+            for second_index in range(first_index + 1, len(dots)):
+                for third_index in range(second_index + 1, len(dots)):
+                    first, second, third = dots[first_index], dots[second_index], dots[third_index]
+                    gap_one = second["x"] - first["x"]
+                    gap_two = third["x"] - second["x"]
+                    average_size = max(
+                        1.0,
+                        (first["width"] + second["width"] + third["width"]) / 3,
+                    )
+                    if not (average_size * 0.8 <= gap_one <= average_size * 5.5):
+                        continue
+                    if not (average_size * 0.8 <= gap_two <= average_size * 5.5):
+                        continue
+                    gap_similarity = min(gap_one, gap_two) / max(gap_one, gap_two)
+                    y_spread = max(first["y"], second["y"], third["y"]) - min(
+                        first["y"], second["y"], third["y"]
+                    )
+                    if gap_similarity < 0.65 or y_spread > max(2.5, average_size * 0.9):
+                        continue
+                    size_similarity = min(first["area"], second["area"], third["area"]) / max(
+                        first["area"], second["area"], third["area"]
+                    )
+                    if size_similarity < 0.45:
+                        continue
+                    # 优先选择标题栏更靠右、也更靠上的候选；浏览器菜单通常位于
+                    # 标签栏/工具栏右侧，而不是网页正文区域。
+                    rightness = third["x"] / max(search_right - search_left, 1)
+                    topness = 1.0 - min(1.0, max(first["y"], second["y"], third["y"]) / title_bottom)
+                    score = (
+                        gap_similarity * 0.40
+                        + size_similarity * 0.20
+                        + rightness * 0.25
+                        + topness * 0.15
+                    )
+                    if best is None or score > best[0]:
+                        best = (score, first, second, third)
+
+        if best is None:
+            return {"found": False, "reason": "标题栏未识别到三点菜单按钮"}
+        score, first, second, third = best
+        center_x = search_left + (first["x"] + second["x"] + third["x"]) / 3
+        center_y = (first["y"] + second["y"] + third["y"]) / 3
+        return {
+            "found": True,
+            "center_x_1000": round(center_x * 1000 / width),
+            "center_y_1000": round(center_y * 1000 / height),
+            "confidence": round(min(0.99, score), 3),
+            "method": "opencv-browser-ellipsis",
         }
 
     def locate_search_box(self, screenshot: Image.Image) -> dict[str, Any]:
