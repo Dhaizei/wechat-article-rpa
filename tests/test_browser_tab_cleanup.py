@@ -11,6 +11,41 @@ import wechat_visual_rpa as rpa
 
 
 class BrowserTabCleanupTests(unittest.TestCase):
+    def test_recovery_never_closes_stale_window(self) -> None:
+        """页面校验失败只允许无损新建，绝不能销毁用户当前窗口。"""
+        stale = rpa.WindowInfo(
+            hwnd=100,
+            title="微信",
+            class_name="Chrome_WidgetWin_0",
+            rect=rpa.Rect(0, 0, 1000, 800),
+            process_name="wechatappex.exe",
+        )
+        recovered = rpa.WindowInfo(
+            hwnd=200,
+            title="搜一搜",
+            class_name="Chrome_WidgetWin_0",
+            rect=rpa.Rect(0, 0, 1000, 800),
+            process_name="wechatappex.exe",
+        )
+        with (
+            patch.object(rpa, "close_window") as close_window,
+            patch.object(
+                rpa,
+                "open_sogou_from_wechat_main",
+                return_value=recovered,
+            ) as open_search,
+            patch.object(rpa, "arrange_automation_window", return_value=recovered),
+            patch.object(rpa, "activate_window"),
+            patch.object(rpa, "press_ctrl_1"),
+            patch.object(rpa.time, "sleep"),
+            patch.object(rpa, "log_event"),
+        ):
+            result = rpa.recreate_sogou_search_window(stale, "测试公众号", "页面校验失败")
+
+        self.assertEqual(result.hwnd, recovered.hwnd)
+        close_window.assert_not_called()
+        open_search.assert_called_once_with("测试公众号", excluded_hwnds={stale.hwnd})
+
     def test_cleanup_recreates_search_window_when_search_tab_is_missing(self) -> None:
         """旧窗口找不到搜一搜标签时，应重建干净窗口而不是终止整个账号。"""
         stale = rpa.WindowInfo(

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .tools/
 config/control_panel.json
+config/run_history.json
 config/account_aliases.json
 config/accounts_remaining.txt
 .env

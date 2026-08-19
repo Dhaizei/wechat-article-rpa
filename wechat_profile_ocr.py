@@ -126,9 +126,12 @@ TIME_LABEL_RE = re.compile(
     r"(?:\d{4}年)?\d{1,2}月\d{1,2}日)$"
 )
 NON_ARTICLE_SECTION_LABELS = {"贴图", "视频号"}
-METRICS_RE = re.compile(r"^阅读\s*([\d.]+万?\+?)\s*赞\s*([\d.]+万?\+?)$")
+METRIC_FRIEND_SUFFIX = r"(?:\s*[\d.]+万?\+?个朋友(?:看过|转发))?"
+METRICS_RE = re.compile(
+    rf"^阅读\s*([\d.]+万?\+?)\s*赞\s*([\d.]+万?\+?){METRIC_FRIEND_SUFFIX}$"
+)
 COMBINED_METRICS_RE = re.compile(
-    r"^(.+?)阅读\s*([\d.]+万?\+?)\s*赞\s*([\d.]+万?\+?)$"
+    rf"^(.+?)阅读\s*([\d.]+万?\+?)\s*赞\s*([\d.]+万?\+?){METRIC_FRIEND_SUFFIX}$"
 )
 
 
@@ -653,6 +656,7 @@ class WeChatProfileOCR:
                 # OCR 偶尔会把标题末行和“阅读/赞”合成一个文本框，先拆开再参与分组。
                 metric = dict(row)
                 metric["normalized"] = f"阅读{combined.group(2)}赞{combined.group(3)}"
+                metric["combined_title"] = combined.group(1)
                 metric_rows.append(metric)
                 row = dict(row)
                 row["text"] = combined.group(1)
@@ -700,6 +704,74 @@ class WeChatProfileOCR:
             title_rows.append(row)
 
         title_rows.sort(key=lambda row: (row["center_y"], row["left"]))
+
+        # 公众号卡片的真实标题位于“阅读/赞”指标正上方；封面图内部可能包含
+        # Logo、榜单、表格和海报文案，不能把所有 OCR 行都视为文章标题。
+        # 优先以指标行为锚点反向寻找相邻标题，只在整页完全没有指标时才使用
+        # 旧的自由文本分组作为兼容回退。
+        anchored_groups: list[tuple[list[dict[str, Any]], dict[str, Any]]] = []
+        for metric in sorted(metric_rows, key=lambda row: (row["center_y"], row["left"])):
+            combined_title = str(metric.get("combined_title") or "").strip()
+            if combined_title:
+                title_row = dict(metric)
+                title_row["text"] = combined_title
+                title_row["normalized"] = _normalize(combined_title)
+                anchored_groups.append(([title_row], metric))
+                continue
+
+            candidates = [
+                row
+                for row in title_rows
+                if row["bottom"] <= metric["top"] + height * 0.008
+                and 0 <= metric["top"] - row["bottom"] <= height * 0.12
+                # 标题和指标左边缘基本对齐。适度放宽以兼容 OCR 框偏移，
+                # 但不能跨到双列布局中的相邻卡片。
+                and abs(row["left"] - metric["left"]) <= width * 0.12
+                and metric["left"] - width * 0.05
+                <= row["center_x"]
+                <= metric["left"] + width * 0.36
+            ]
+            if not candidates:
+                continue
+            nearest = max(candidates, key=lambda row: (row["bottom"], row["confidence"]))
+            group = [nearest]
+            # 只取最靠近指标的一行。卡片标题被截断时，后续标题校验支持可靠的
+            # 8 字以上前缀；向上盲目合并反而会吞入封面底部的表格或海报文字。
+            anchored_groups.append((group, metric))
+
+        if anchored_groups:
+            articles = []
+            seen_anchors: set[tuple[str, int, int]] = set()
+            for group, metric in anchored_groups:
+                title = "".join(row["text"] for row in group).strip()
+                top = min(row["top"] for row in group)
+                bottom = max(row["bottom"] for row in group)
+                left = min(row["left"] for row in group)
+                right = max(row["right"] for row in group)
+                match = METRICS_RE.fullmatch(metric["normalized"])
+                read_count = _number(match.group(1)) if match else None
+                like_count = _number(match.group(2)) if match else None
+                anchor_key = (_normalize(title), round(metric["center_x"]), round(metric["center_y"]))
+                if not title or anchor_key in seen_anchors:
+                    continue
+                seen_anchors.add(anchor_key)
+                articles.append(
+                    {
+                        "title": title,
+                        "center_x_1000": round(((left + right) / 2) * 1000 / width),
+                        "center_y_1000": round(((top + bottom) / 2) * 1000 / height),
+                        "confidence": round(min(row["confidence"] for row in group), 4),
+                        "list_read_count": read_count,
+                        "list_like_count": like_count,
+                    }
+                )
+            return {
+                "time_labels": sorted(labels, key=lambda item: item["center_y_1000"]),
+                "articles": articles,
+                "recognition_method": "rapidocr-profile-feed-metric-anchored",
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+
         groups: list[list[dict[str, Any]]] = []
         for row in title_rows:
             if not groups:

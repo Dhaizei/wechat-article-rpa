@@ -46,11 +46,25 @@ from wechat_profile_ocr import WeChatProfileOCR
 
 
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 user32.GetClipboardData.argtypes = [wintypes.UINT]
 user32.GetClipboardData.restype = ctypes.c_void_p
-ctypes.windll.kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-ctypes.windll.kernel32.GlobalLock.restype = ctypes.c_void_p
-ctypes.windll.kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
 
 RPA_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = RPA_DIR / "output"
@@ -64,6 +78,18 @@ PROFILE_OCR = WeChatProfileOCR()
 ARTICLE_EVIDENCE_OCR = ArticleEvidenceOCR()
 RUN_LOGGER = logging.getLogger("wechat_rpa")
 WINDOW_LAYOUT_MODE = "auto"
+# 微信 3.x/4.x 及其内置 Chromium 子进程可能使用不同可执行文件名。
+# 普通 chrome.exe/msedge.exe 即使窗口标题恰好为“微信”，也绝不能进入自动化范围。
+WECHAT_PROCESS_NAMES = frozenset(
+    {
+        "wechat.exe",
+        "wechatappex.exe",
+        "wechatbrowser.exe",
+        "weixin.exe",
+        "weixinappex.exe",
+    }
+)
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 
 def _read_ui_position_cache() -> dict[str, Any]:
@@ -356,6 +382,7 @@ class WindowInfo:
     title: str
     class_name: str
     rect: Rect
+    process_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -375,6 +402,34 @@ class CropRegion:
         )
 
 
+def window_process_name(hwnd: int) -> str:
+    """返回窗口所属进程名；无法确认时返回空串并按非微信窗口处理。"""
+    process_id = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+    if not process_id.value:
+        return ""
+    process = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, process_id.value
+    )
+    if not process:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        executable = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(
+            process, 0, executable, ctypes.byref(size)
+        ):
+            return ""
+        return Path(executable.value).name.lower()
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def is_wechat_owned_window(hwnd: int) -> bool:
+    """只信任明确属于微信进程的窗口，未知归属一律安全拒绝。"""
+    return window_process_name(hwnd) in WECHAT_PROCESS_NAMES
+
+
 def enumerate_wechat_windows() -> list[WindowInfo]:
     """枚举微信主窗口、公众号消息窗口和文章浏览器窗口。"""
     windows: list[WindowInfo] = []
@@ -391,6 +446,9 @@ def enumerate_wechat_windows() -> list[WindowInfo]:
         is_chrome_window = class_name.startswith("Chrome_WidgetWin_")
         if not (is_qt_window or is_chrome_window):
             return True
+        process_name = window_process_name(hwnd)
+        if process_name not in WECHAT_PROCESS_NAMES:
+            return True
         length = user32.GetWindowTextLengthW(hwnd)
         title_buffer = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, title_buffer, length + 1)
@@ -399,7 +457,15 @@ def enumerate_wechat_windows() -> list[WindowInfo]:
             return True
         rect = Rect(raw.left, raw.top, raw.right, raw.bottom)
         if rect.width > 500 and rect.height > 500:
-            windows.append(WindowInfo(hwnd, title_buffer.value, class_buffer.value, rect))
+            windows.append(
+                WindowInfo(
+                    hwnd,
+                    title_buffer.value,
+                    class_buffer.value,
+                    rect,
+                    process_name,
+                )
+            )
         return True
 
     user32.EnumWindows(callback, 0)
@@ -418,23 +484,54 @@ def find_search_window() -> WindowInfo:
     return max(candidates, key=lambda item: item.rect.width * item.rect.height)
 
 
-def find_sogou_search_window() -> WindowInfo:
+def is_sogou_search_window(window: WindowInfo) -> bool:
+    """判断窗口是否为搜一搜浏览器，兼容新版“公众号名 - 公众号搜一搜”标题。"""
+    title = window.title.strip()
+    return (
+        window.process_name in WECHAT_PROCESS_NAMES
+        and window.class_name.startswith("Chrome_WidgetWin_")
+        and (
+            title == "微信" or "搜一搜" in title
+        )
+    )
+
+
+def find_sogou_search_window(
+    excluded_hwnds: set[int] | frozenset[int] | None = None,
+) -> WindowInfo:
     """查找微信搜一搜浏览器窗口；文章会在该窗口的新标签页中打开。"""
     candidates = [
         item for item in enumerate_wechat_windows()
-        if item.class_name.startswith("Chrome_WidgetWin_")
-        and item.title.strip() == "微信"
+        if is_sogou_search_window(item)
+        and item.hwnd not in (excluded_hwnds or set())
     ]
     if not candidates:
         raise RuntimeError("没有找到微信搜一搜窗口，请先在微信中打开搜一搜")
-    return max(candidates, key=lambda item: item.rect.width * item.rect.height)
+    # 新版窗口标题会直接包含“搜一搜”，优先级高于旧版仅显示“微信”的兼容候选。
+    return max(
+        candidates,
+        key=lambda item: (
+            int("搜一搜" in item.title),
+            item.rect.width * item.rect.height,
+        ),
+    )
 
 
-def open_sogou_from_wechat_main(account_name: str) -> WindowInfo:
+def open_sogou_from_wechat_main(
+    account_name: str,
+    *,
+    excluded_hwnds: set[int] | frozenset[int] | None = None,
+) -> WindowInfo:
     """搜一搜窗口缺失时，从已登录的微信主窗口自动恢复。"""
     # 主窗口可能是 Qt，也可能是新版 Chromium 窗口，统一走管理窗口探测。
     main_hwnd, main_rect = find_wechat_manager_window()
-    main_window = WindowInfo(main_hwnd, "微信", "Chrome_WidgetWin_0", main_rect)
+    main_window = WindowInfo(
+        main_hwnd,
+        "微信",
+        "Chrome_WidgetWin_0",
+        main_rect,
+        window_process_name(main_hwnd),
+    )
     activate_window(main_window.hwnd)
     screenshot = capture_window(main_window.rect)
     search_box = PROFILE_OCR.locate_search_box(screenshot)
@@ -473,7 +570,7 @@ def open_sogou_from_wechat_main(account_name: str) -> WindowInfo:
     while time.time() < deadline:
         time.sleep(0.4)
         try:
-            window = find_sogou_search_window()
+            window = find_sogou_search_window(excluded_hwnds)
             log_event("sogou_recovery_succeeded", account=account_name, hwnd=window.hwnd)
             return window
         except RuntimeError:
@@ -497,7 +594,7 @@ def open_sogou_from_wechat_main(account_name: str) -> WindowInfo:
     while time.time() < deadline:
         time.sleep(0.4)
         try:
-            window = find_sogou_search_window()
+            window = find_sogou_search_window(excluded_hwnds)
             log_event("sogou_recovery_succeeded", account=account_name, hwnd=window.hwnd, method="down-enter")
             return window
         except RuntimeError:
@@ -510,7 +607,7 @@ def recreate_sogou_search_window(
     account_name: str,
     reason: str,
 ) -> WindowInfo:
-    """搜索窗口被文章标签占用时，关闭失效窗口并从微信主窗口重新创建搜一搜。"""
+    """无损新建搜一搜窗口；旧窗口无论是否失效都不得由恢复流程关闭。"""
     log_event(
         "search_page_recovery_started",
         account=account_name,
@@ -520,11 +617,14 @@ def recreate_sogou_search_window(
             "title": stale_window.title,
             "class_name": stale_window.class_name,
         },
+        action="preserve_stale_window_and_open_new",
     )
-    if user32.IsWindow(stale_window.hwnd):
-        close_window(stale_window.hwnd)
-        time.sleep(0.6)
-    recovered = open_sogou_from_wechat_main(account_name)
+    # 页面 OCR 失败不能证明窗口可以安全销毁。排除旧 HWND，只接受新出现的微信窗口；
+    # 若微信复用旧窗口，则让任务失败并保留用户现场，等待人工处理。
+    recovered = open_sogou_from_wechat_main(
+        account_name,
+        excluded_hwnds={stale_window.hwnd},
+    )
     recovered = arrange_automation_window(recovered, "browser")
     activate_window(recovered.hwnd)
     press_ctrl_1()
@@ -545,6 +645,8 @@ def find_official_profile_window() -> WindowInfo:
             or (item.class_name.startswith("Qt") and item.class_name.endswith("QWindowIcon"))
         )
         and "公众号" in item.title.strip()
+        # “公众号名 - 公众号搜一搜”是左侧搜索浏览器，不是右侧公众号资料页。
+        and not is_sogou_search_window(item)
     ]
     if not candidates:
         raise RuntimeError("没有找到微信公众号资料窗口")
@@ -565,7 +667,13 @@ def find_account_message_window(account_name: str) -> WindowInfo:
 
 
 def close_window(hwnd: int, timeout_seconds: float = 3.0) -> None:
-    """只关闭明确记录的窗口句柄，避免误关微信搜索主窗口。"""
+    """只关闭当前仍明确属于微信进程的窗口句柄。"""
+    process_name = window_process_name(hwnd)
+    if process_name not in WECHAT_PROCESS_NAMES:
+        raise RuntimeError(
+            "拒绝关闭非微信窗口："
+            f"hwnd={hwnd}, process={process_name or 'unknown'}"
+        )
     user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
     deadline = time.time() + timeout_seconds
     while time.time() < deadline and user32.IsWindow(hwnd):
@@ -603,6 +711,8 @@ def find_wechat_manager_window() -> tuple[int, Rect]:
         is_qt_window = class_name.value.startswith("Qt") and class_name.value.endswith("QWindowIcon")
         is_chrome_window = class_name.value.startswith("Chrome_WidgetWin_")
         if title.value.strip() != "微信" or not (is_qt_window or is_chrome_window):
+            return True
+        if not is_wechat_owned_window(hwnd):
             return True
         raw = wintypes.RECT()
         initial_area = 0
@@ -649,6 +759,8 @@ def find_article_window() -> tuple[int, Rect]:
         user32.GetWindowTextW(hwnd, title, 64)
         user32.GetClassNameW(hwnd, class_name, 256)
         if title.value.strip() != "微信" or not class_name.value.startswith("Chrome_WidgetWin_"):
+            return True
+        if not is_wechat_owned_window(hwnd):
             return True
         raw = wintypes.RECT()
         if user32.GetWindowRect(hwnd, ctypes.byref(raw)):
@@ -846,7 +958,7 @@ def close_article_tabs_until_search(account_name: str) -> None:
     search_window = find_sogou_search_window()
     if not find_and_pin_search_tab(search_window, account_name):
         # 搜索标签可能已被异常流程关闭或替换。此时不在旧窗口里继续盲目 Ctrl+W，
-        # 而是销毁这个已失去基准页的浏览器窗口，再从微信主窗口恢复一个干净的搜一搜页。
+        # 也不销毁旧窗口；只尝试从微信主窗口无损打开一个新的搜一搜页。
         search_window = recreate_sogou_search_window(
             search_window,
             account_name,
@@ -994,7 +1106,13 @@ def arrange_automation_window(window: WindowInfo, role: str) -> WindowInfo:
         actual = Rect(raw.left, raw.top, raw.right, raw.bottom)
     else:
         actual = window.rect
-    arranged = WindowInfo(window.hwnd, window.title, window.class_name, actual)
+    arranged = WindowInfo(
+        window.hwnd,
+        window.title,
+        window.class_name,
+        actual,
+        window.process_name,
+    )
     log_event(
         "window_arranged",
         role=role,
@@ -1424,6 +1542,10 @@ def titles_match(expected: str, actual: str) -> bool:
     # 浏览器标签受窗口宽度限制时不会显示省略号，只保留标题前缀。
     # 同时还有网页大标题、公众号名称及前后 URL 校验，因此 8 字以上前缀可安全接受。
     if len(expected_canonical) >= 8 and actual_canonical.startswith(expected_canonical):
+        return True
+    # 指标锚定模式优先读取紧贴“阅读/赞”的最后一行；多行标题因此可能只留下
+    # 末行。公众号归属和复制前后 URL 仍会独立校验，6 字以上的完整后缀可接受。
+    if len(expected_canonical) >= 6 and actual_canonical.endswith(expected_canonical):
         return True
     # OCR 的窗口标签经常只保留前半段，并把 AI/Al、O/0 等单字符读错。
     # 比较较短标题与真实标题等长前缀；公众号名称和 URL 仍会独立严格校验。
@@ -2327,6 +2449,7 @@ def search_and_open_profile(
                 "hwnd": item.hwnd,
                 "title": item.title,
                 "class_name": item.class_name,
+                "process_name": item.process_name,
                 "width": item.rect.width,
                 "height": item.rect.height,
             }
@@ -2694,7 +2817,7 @@ def build_card_signature(
     time_group: str, article: dict[str, Any]
 ) -> tuple[str, str, int, int] | None:
     """生成保守的卡片指纹；任一互动数字缺失时不做点击前去重。"""
-    title = normalize_title(str(article.get("title") or ""))
+    title = canonical_title_for_match(str(article.get("title") or ""))
     group = normalize_title(time_group)
     read_count = article.get("list_read_count")
     like_count = article.get("list_like_count")
@@ -2705,7 +2828,9 @@ def build_card_signature(
 
 def build_card_title_signature(time_group: str, article: dict[str, Any]) -> tuple[str, str] | None:
     """生成本轮终态去重指纹；互动数缺失时仍可阻止同一卡片重复打开。"""
-    title = normalize_title(str(article.get("title") or ""))
+    # 去除省略号、引号和 OCR 常见 AI/Al 差异，避免同一卡片在相邻屏幕中
+    # 仅因展示截断不同而被重复打开。
+    title = canonical_title_for_match(str(article.get("title") or ""))
     group = normalize_title(time_group)
     return (group, title) if group and title else None
 
@@ -3026,6 +3151,10 @@ def collect_profile_account(
         for page_index in range(1, 13):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"账号 {account_name} 达到任务超时限制")
+            # 每次滚屏后的顶部可能是上一分区残留的贴图/视频卡片。不能沿用
+            # 上一屏最后一个日期标签，否则这些无标签卡片会被误归到“昨天”。
+            # 宁可将缺少本屏日期证据的卡片记为 ungrouped，下一屏重叠区域仍可补抓。
+            current_group = ""
             feed = analyze_profile_window(
                 profile_window,
                 output_dir / "profile" / f"page-{page_index:02d}",

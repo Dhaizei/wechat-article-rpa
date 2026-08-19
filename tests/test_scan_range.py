@@ -50,6 +50,11 @@ class ScanRangeTests(unittest.TestCase):
         )
         self.assertEqual(signature, ("今天", "同一篇文章"))
 
+    def test_title_signature_ignores_ellipsis_variants(self) -> None:
+        first = build_card_title_signature("昨天", {"title": "同一篇较长文章.."})
+        second = build_card_title_signature("昨天", {"title": "同一篇较长文章..."})
+        self.assertEqual(first, second)
+
 
 if __name__ == "__main__":
     unittest.main()

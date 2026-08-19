@@ -101,6 +101,14 @@ class CollectionResilienceTests(unittest.TestCase):
             )
         )
 
+    def test_last_line_of_multiline_card_title_matches_article_suffix(self) -> None:
+        self.assertTrue(
+            rpa.titles_match(
+                "热门插件被锤了",
+                "一个Skill让DeepSeek V4 Pro超越Fable 5？热门插件被锤了",
+            )
+        )
+
     def test_partial_account_results_survive_later_fatal_error(self) -> None:
         """账号后续失败时，已成功写出的文章必须保留在批次摘要中。"""
         with tempfile.TemporaryDirectory() as directory:
