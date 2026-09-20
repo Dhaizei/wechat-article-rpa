@@ -34,23 +34,19 @@
           <button class="text-button" id="refreshPreflight" type="button">重新检测并尝试打开</button>
         </div>
         <div class="preflight-checks">
-          <div class="preflight-item" id="wechatCheck">
-            <span class="check-icon">?</span>
-            <div><strong>微信已登录</strong><small>正在检测</small></div>
-          </div>
           <div class="preflight-item" id="searchCheck">
             <span class="check-icon">?</span>
-            <div><strong>“搜一搜”已打开</strong><small>正在检测</small></div>
+            <div><strong>微信采集页面已打开</strong><small>正在检测</small></div>
           </div>
         </div>
         <details class="automation-guide">
           <summary>采集过程中会自动处理什么？</summary>
           <div class="automation-guide-content">
-            <p><strong>窗口自动管理</strong>：公众号资料窗口和文章窗口会按顺序打开、校验并关闭，无需手工排列。</p>
+            <p><strong>页面自动管理</strong>：兼容公众号主页标签与独立窗口，打开文章后验证返回原列表。</p>
             <p id="desktopCheck"><strong>屏幕与缩放适配</strong>：正在读取当前分辨率和缩放比例。</p>
           </div>
         </details>
-        <p class="preflight-guide">点击“重新检测并尝试打开”后，控制台会自动在已登录微信中搜索并打开“搜一搜”；若微信未登录或正在采集，则会提示你下一步操作。</p>
+        <p class="preflight-guide">这里仅检查微信采集页面是否可识别；进入公众号、打开文章和返回列表会在采集时逐步验证。尚未打开时可点击“重新检测并尝试打开”。</p>
       </section>
 
       <section class="control-panel" aria-labelledby="controlTitle">
@@ -155,7 +151,7 @@
               <strong id="currentState">空闲</strong>
             </div>
             <div class="progress-track"><span id="progressBar"></span></div>
-            <p id="currentDetail">确认微信已登录，并保持“搜一搜”窗口可见。</p>
+            <p id="currentDetail">请保持“搜一搜”窗口可见。</p>
           </div>
         </article>
 

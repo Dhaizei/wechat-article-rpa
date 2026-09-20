@@ -46,6 +46,19 @@ class ControlPanelTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_default_listener_uses_all_network_interfaces(self) -> None:
+        """默认应开放局域网监听，同时允许命令行显式覆盖。"""
+        with patch.object(panel, "CONTROL_PANEL_HOST", "0.0.0.0"):
+            with patch("sys.argv", ["rpa_control_panel.py"]):
+                args = panel.parse_args()
+
+        self.assertEqual(args.host, "0.0.0.0")
+
+    def test_wildcard_listener_opens_a_reachable_local_browser_url(self) -> None:
+        """监听全部网卡时，自动打开的浏览器不能使用不可导航的通配地址。"""
+        self.assertEqual(panel.browser_url_for_listener("0.0.0.0", 8010), "http://127.0.0.1:8010/")
+        self.assertEqual(panel.browser_url_for_listener("192.168.28.88", 8010), "http://192.168.28.88:8010/")
+
     def test_run_status_reflects_business_failures_even_with_zero_exit_code(self) -> None:
         """子进程正常退出不等于采集成功，全部账号失败时必须显示异常退出。"""
         status, message = panel.determine_final_run_status(
@@ -66,6 +79,126 @@ class ControlPanelTests(unittest.TestCase):
 
         self.assertEqual(status, "partial")
 
+    def test_low_article_alert_includes_threshold_boundary(self) -> None:
+        self.assertTrue(
+            panel.should_send_low_article_alert(
+                status="completed", summary={"articles_collected": 10}
+            )
+        )
+        self.assertFalse(
+            panel.should_send_low_article_alert(
+                status="completed", summary={"articles_collected": 11}
+            )
+        )
+
+    def test_low_article_alert_skips_manually_cancelled_run(self) -> None:
+        self.assertFalse(
+            panel.should_send_low_article_alert(
+                status="cancelled", summary={"articles_collected": 0}
+            )
+        )
+
+    def test_feishu_alert_contains_diagnostics_and_threshold(self) -> None:
+        response = unittest.mock.Mock()
+        response.json.return_value = {"code": 0}
+        with patch.dict("os.environ", {"FEISHU_WEBHOOK": "https://example.test/hook"}), patch.object(
+            panel.requests, "post", return_value=response
+        ) as post:
+            sent = panel.send_low_article_feishu_alert(
+                run_id="run-123",
+                status="partial",
+                summary={
+                    "articles_collected": 3,
+                    "accounts_failed": 2,
+                    "accounts_finished": 5,
+                    "total_accounts": 6,
+                },
+                parameters={"scan_range": "today"},
+                finished_at="2026-08-12T22:00:00",
+            )
+
+        self.assertTrue(sent)
+        payload = post.call_args.kwargs["json"]
+        content = payload["card"]["elements"][0]["text"]["content"]
+        self.assertIn("3 篇文章", content)
+        self.assertIn("预警阈值 10 篇", content)
+        self.assertIn("达到或低于", content)
+        self.assertIn("失败公众号：2", content)
+        self.assertIn("任务 ID：run-123", content)
+
+    def test_feishu_started_notification_contains_run_parameters(self) -> None:
+        response = unittest.mock.Mock()
+        response.json.return_value = {"code": 0}
+        with patch.dict("os.environ", {"FEISHU_WEBHOOK": "https://example.test/hook"}), patch.object(
+            panel.requests, "post", return_value=response
+        ) as post:
+            sent = panel.send_run_started_feishu_notification(
+                run_id="run-start",
+                source="manual",
+                parameters={"scan_range": "today", "max_articles": 5},
+                started_at="2026-08-20T09:00:00",
+            )
+
+        self.assertTrue(sent)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(
+            payload["card"]["header"]["title"]["content"], "文章抓取任务开始"
+        )
+        content = payload["card"]["elements"][0]["text"]["content"]
+        self.assertIn("手动任务", content)
+        self.assertIn("每账号上限：5 篇", content)
+        self.assertIn("任务 ID：run-start", content)
+
+    def test_feishu_blocked_notification_contains_recovery_reason(self) -> None:
+        response = unittest.mock.Mock()
+        response.json.return_value = {"code": 0}
+        preflight = blocked_preflight()
+        preflight["recovery"] = {
+            "attempted": True,
+            "succeeded": False,
+            "message": "Ctrl+F 与 Qwen-VL 均未打开搜一搜窗口",
+        }
+        with patch.dict("os.environ", {"FEISHU_WEBHOOK": "https://example.test/hook"}), patch.object(
+            panel.requests, "post", return_value=response
+        ) as post:
+            sent = panel.send_run_blocked_feishu_notification(
+                run_id="run-blocked",
+                source="scheduled",
+                parameters={"scan_range": "today"},
+                preflight=preflight,
+                blocked_at="2026-09-03T08:00:00",
+            )
+
+        self.assertTrue(sent)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["card"]["header"]["template"], "red")
+        content = payload["card"]["elements"][0]["text"]["content"]
+        self.assertIn("定时任务", content)
+        self.assertIn("Ctrl+F 与 Qwen-VL", content)
+        self.assertIn("任务 ID：run-blocked", content)
+
+    def test_feishu_finished_notification_covers_cancelled_run(self) -> None:
+        response = unittest.mock.Mock()
+        response.json.return_value = {"code": 0}
+        with patch.dict("os.environ", {"FEISHU_WEBHOOK": "https://example.test/hook"}), patch.object(
+            panel.requests, "post", return_value=response
+        ) as post:
+            sent = panel.send_run_finished_feishu_notification(
+                run_id="run-stop",
+                status="cancelled",
+                summary={"articles_collected": 7, "accounts_finished": 3, "total_accounts": 6},
+                parameters={"scan_range": "today"},
+                finished_at="2026-08-20T09:30:00",
+            )
+
+        self.assertTrue(sent)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["card"]["header"]["template"], "grey")
+        content = payload["card"]["elements"][0]["text"]["content"]
+        self.assertIn("已手动停止", content)
+        self.assertIn("成功抓取文章：7 篇", content)
+        self.assertIn("任务 ID：run-stop", content)
+
     def test_history_marks_abandoned_running_record_as_interrupted(self) -> None:
         history_path = self.temp_path / "run_history.json"
         history = panel.RunHistory(history_path)
@@ -82,9 +215,17 @@ class ControlPanelTests(unittest.TestCase):
     def test_blocked_preflight_creates_traceable_run_record(self) -> None:
         state = panel.ControlState()
         state.history = panel.RunHistory(self.temp_path / "run_history.json")
+        recovered = blocked_preflight()
+        recovered["recovery"] = {
+            "attempted": True,
+            "succeeded": False,
+            "message": "自动恢复搜一搜失败",
+        }
         with patch.object(panel, "collect_preflight", return_value=blocked_preflight()), patch.object(
-            panel, "PANEL_LOG_PATH", self.temp_path / "control-panel.log"
-        ):
+            panel, "recover_sogou_preflight", return_value=recovered
+        ) as recover, patch.object(
+            panel, "send_run_blocked_feishu_notification", return_value=False
+        ) as notify, patch.object(panel, "PANEL_LOG_PATH", self.temp_path / "control-panel.log"):
             started, message = state.start_job(
                 "manual", max_articles=5, scan_range="today", metrics="share"
             )
@@ -95,6 +236,39 @@ class ControlPanelTests(unittest.TestCase):
         self.assertEqual(record["status"], "blocked")
         self.assertEqual(record["parameters"]["scan_range"], "today")
         self.assertEqual(record["parameters"]["metrics"], "share")
+        recover.assert_called_once_with(running=False)
+        notify.assert_called_once()
+
+    def test_search_window_alone_allows_collection_to_start(self) -> None:
+        """唯一硬性前置条件是搜一搜窗口，微信主窗口只服务于自动恢复。"""
+        search_window = {
+            "title": "腾讯技术工程 - 账号 - 搜一搜",
+            "class_name": "Chrome_WidgetWin_0",
+        }
+        with patch.object(panel, "_visible_windows", return_value=[search_window]), patch.object(
+            panel, "collect_desktop_environment", return_value={"ok": True, "message": "测试桌面"}
+        ):
+            result = panel.collect_preflight()
+
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["wechat"]["ok"])
+        self.assertTrue(result["search"]["ok"])
+
+    def test_chromium_wechat_main_window_is_not_mistaken_for_sogou(self) -> None:
+        """新版微信主窗口也是 Chromium，不能仅凭标题“微信”判定搜一搜已打开。"""
+        main_window = {
+            "title": "微信",
+            "class_name": "Chrome_WidgetWin_0",
+            "process_name": "weixin.exe",
+        }
+        with patch.object(panel, "_visible_windows", return_value=[main_window]), patch.object(
+            panel, "collect_desktop_environment", return_value={"ok": True, "message": "测试桌面"}
+        ):
+            result = panel.collect_preflight()
+
+        self.assertFalse(result["ready"])
+        self.assertTrue(result["wechat"]["ok"])
+        self.assertFalse(result["search"]["ok"])
 
     def test_invalid_run_options_are_rejected_before_process_launch(self) -> None:
         state = panel.ControlState()
@@ -371,7 +545,9 @@ class ControlPanelTests(unittest.TestCase):
         process = FakeProcess()
         state.process = process  # type: ignore[assignment]
         state.active_run_id = "summary-test"
-        with patch.object(panel, "PANEL_LOG_PATH", self.temp_path / "control-panel.log"):
+        with patch.object(
+            panel, "PANEL_LOG_PATH", self.temp_path / "control-panel.log"
+        ), patch.object(panel, "send_low_article_feishu_alert", return_value=False):
             state._read_process(process, "summary-test")  # type: ignore[arg-type]
 
         messages = [item["message"] for item in state.logs]

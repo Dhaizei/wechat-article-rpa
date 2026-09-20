@@ -134,6 +134,20 @@ Only set found=true when the visible account name exactly equals {expected_name!
 Coordinates are normalized from 0 to 1000 relative to the complete window."""
         return self.analyze(window, prompt, max_tokens=500)
 
+    def detect_wechat_search_entry(self, window: Image.Image) -> dict[str, Any]:
+        """定位微信主窗口顶部的“搜索网络结果”入口。"""
+        prompt = """This is the complete WeChat desktop main window after Ctrl+F, typing 搜一搜,
+and pressing Enter once. Locate the clickable TOP row whose visible Chinese label starts with
+搜索网络结果. It is directly below the global search box on the LEFT side of the WeChat window.
+Do not select query suggestions, chat history, messages, official-account articles, browser
+content, or text whose label is only 搜一搜.
+Return ONLY valid JSON:
+{"found":boolean,"label":string|null,"center_x_1000":integer|null,
+"center_y_1000":integer|null,"confidence":number}.
+Set found=true only when the 搜索网络结果 row is visibly present. Coordinates are normalized
+integers from 0 to 1000 relative to the complete WeChat window. Never guess."""
+        return self.analyze(window, prompt, max_tokens=350)
+
     def verify_profile_header(self, window: Image.Image, expected_name: str) -> dict[str, Any]:
         """复核公众号资料窗口头部名称。
 

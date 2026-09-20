@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import unicodedata
 from ctypes import wintypes
@@ -24,6 +25,11 @@ from PIL import Image, ImageChops, ImageGrab, ImageStat
 from pymongo import MongoClient
 
 from env_config import load_project_env
+from wechat_window_probe import has_search_tab, probe_page, select_tab
+from runtime_diagnostics import runtime_identity
+from browser_navigation import Navigator, Page, Checkpoint, InventoryCache, tab_signature, selected_tab, page_from_probe, feed_from_probe, picture_share_count
+from network_metrics import read_snapshot
+from tab_ownership import TabOwnership
 
 
 # 命令行直接启动采集器时也自动加载项目配置，不依赖 PowerShell 会话变量。
@@ -316,6 +322,29 @@ def normalize_qwen_menu_button_action(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_qwen_wechat_search_entry(result: dict[str, Any]) -> dict[str, Any]:
+    """只接受 Qwen-VL 在微信左上区域识别出的“搜索网络结果”入口。"""
+    label = str(result.get("label") or "").replace(" ", "")
+    if not result.get("found") or not label.startswith("搜索网络结果"):
+        return {"found": False, "reason": "Qwen-VL 未确认搜索网络结果入口"}
+    try:
+        x_1000 = int(result["center_x_1000"])
+        y_1000 = int(result["center_y_1000"])
+        confidence = float(result.get("confidence") or 0)
+    except (KeyError, TypeError, ValueError):
+        return {"found": False, "reason": "Qwen-VL 返回的搜一搜坐标格式错误"}
+    if not (0 <= x_1000 <= 550 and 30 <= y_1000 <= 220) or confidence < 0.80:
+        return {"found": False, "reason": "Qwen-VL 搜索网络结果坐标越界或置信度不足"}
+    return {
+        "found": True,
+        "text": label,
+        "center_x_1000": x_1000,
+        "center_y_1000": y_1000,
+        "confidence": confidence,
+        "method": "qwen-vl-wechat-network-search-entry",
+    }
+
+
 def resolve_search_account_name(account_name: str) -> str:
     """返回搜一搜使用的名称；别名只改变检索词，不改变 MongoDB 中的来源账号名。"""
     try:
@@ -383,6 +412,8 @@ class WindowInfo:
     class_name: str
     rect: Rect
     process_name: str = ""
+    shared_browser: bool = False
+    profile_checkpoint: Checkpoint | None = None
 
 
 @dataclass(frozen=True)
@@ -487,11 +518,15 @@ def find_search_window() -> WindowInfo:
 def is_sogou_search_window(window: WindowInfo) -> bool:
     """判断窗口是否为搜一搜浏览器，兼容新版“公众号名 - 公众号搜一搜”标题。"""
     title = window.title.strip()
+    legacy_embedded_processes = {"wechatappex.exe", "wechatbrowser.exe", "weixinappex.exe"}
     return (
         window.process_name in WECHAT_PROCESS_NAMES
         and window.class_name.startswith("Chrome_WidgetWin_")
         and (
-            title == "微信" or "搜一搜" in title
+            "搜一搜" in title
+            # 旧版内置浏览器标题只有“微信”，必须同时确认它属于 AppEx/Browser
+            # 子进程，避免把新版 Chromium 微信主窗口误判为搜一搜。
+            or (title == "微信" and window.process_name in legacy_embedded_processes)
         )
     )
 
@@ -500,11 +535,34 @@ def find_sogou_search_window(
     excluded_hwnds: set[int] | frozenset[int] | None = None,
 ) -> WindowInfo:
     """查找微信搜一搜浏览器窗口；文章会在该窗口的新标签页中打开。"""
-    candidates = [
+    metadata_candidates = [
         item for item in enumerate_wechat_windows()
         if is_sogou_search_window(item)
         and item.hwnd not in (excluded_hwnds or set())
     ]
+    candidates: list[WindowInfo] = []
+    for item in metadata_candidates:
+        if "搜一搜" in item.title:
+            candidates.append(item)
+            continue
+        # 系统标题为“微信”时读取真实标签名；被遮挡或当前处于文章标签也能识别。
+        if has_search_tab(item.hwnd):
+            candidates.append(item)
+            continue
+        # 旧版内置浏览器标题只有“微信”。仅凭进程名仍可能撞到小程序或其他
+        # WeChatAppEx 窗口，因此必须看到搜一搜搜索框和账号导航后才接纳。
+        try:
+            evidence = _inspect_sogou_search_results(capture_window(item.rect))
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                "legacy_sogou_window_validation_failed",
+                hwnd=item.hwnd,
+                reason=str(exc),
+            )
+            continue
+        if evidence.get("found"):
+            candidates.append(item)
+            log_event("legacy_sogou_window_validated", hwnd=item.hwnd)
     if not candidates:
         raise RuntimeError("没有找到微信搜一搜窗口，请先在微信中打开搜一搜")
     # 新版窗口标题会直接包含“搜一搜”，优先级高于旧版仅显示“微信”的兼容候选。
@@ -521,8 +579,14 @@ def open_sogou_from_wechat_main(
     account_name: str,
     *,
     excluded_hwnds: set[int] | frozenset[int] | None = None,
+    client: QwenVisionClient | None = None,
+    allow_vl: bool = True,
 ) -> WindowInfo:
-    """搜一搜窗口缺失时，从已登录的微信主窗口自动恢复。"""
+    """搜一搜窗口缺失时，从已登录的微信主窗口自动恢复。
+
+    优先使用微信原生 Ctrl+F 键盘流程；失败后才用本地 OCR 点击精确入口，
+    最后允许 Qwen-VL 兜底。每次动作都必须由新搜一搜窗口出现来确认成功。
+    """
     # 主窗口可能是 Qt，也可能是新版 Chromium 窗口，统一走管理窗口探测。
     main_hwnd, main_rect = find_wechat_manager_window()
     main_window = WindowInfo(
@@ -532,74 +596,121 @@ def open_sogou_from_wechat_main(
         main_rect,
         window_process_name(main_hwnd),
     )
-    activate_window(main_window.hwnd)
-    screenshot = capture_window(main_window.rect)
-    search_box = PROFILE_OCR.locate_search_box(screenshot)
-    if not search_box.get("found"):
-        # 微信主界面搜索框布局与搜一搜网页不同，OCR 失败时使用相对坐标兜底。
-        search_box = {"found": True, "center_x_1000": 225, "center_y_1000": 64}
-        log_event("wechat_main_search_box_fallback", account=account_name)
-    # 先打开微信内置的“搜一搜”浏览器，具体公众号名称由后续网页流程输入。
-    set_clipboard_text("搜一搜")
-    click(
-        main_window.rect.left
-        + round(main_window.rect.width * int(search_box["center_x_1000"]) / 1000),
-        main_window.rect.top
-        + round(main_window.rect.height * int(search_box["center_y_1000"]) / 1000),
-    )
-    press_ctrl_a()
-    press_ctrl_v()
-    if "button_x_1000" in search_box:
-        click(
-            main_window.rect.left
-            + round(main_window.rect.width * int(search_box["button_x_1000"]) / 1000),
-            main_window.rect.top
-            + round(main_window.rect.height * int(search_box["button_y_1000"]) / 1000),
-        )
-    else:
-        # 微信主窗口的候选下拉框第一项就是“搜一搜”。优先用键盘确认，
-        # 后面再由窗口探测结果决定是否需要鼠标点击兜底。
-        press_enter()
+    excluded = excluded_hwnds or set()
+
+    def wait_for_search_window(timeout_seconds: float, method: str) -> WindowInfo | None:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            time.sleep(0.4)
+            try:
+                window = find_sogou_search_window(excluded)
+                log_event(
+                    "sogou_recovery_succeeded",
+                    account=account_name,
+                    hwnd=window.hwnd,
+                    method=method,
+                )
+                return window
+            except RuntimeError:
+                continue
+        return None
+
+    def focus_and_type_query() -> None:
+        """使用微信原生快捷键聚焦全局搜索，不依赖窗口坐标。"""
+        activate_window(main_window.hwnd)
+        press_ctrl_f()
+        time.sleep(0.35)
+        set_clipboard_text("搜一搜")
+        press_ctrl_a()
+        press_ctrl_v()
+        time.sleep(0.55)
+
+    # 第一次回车会在微信 4.x 中展开“搜索网络结果”入口；少数版本会直接
+    # 打开搜一搜，因此先短暂等待一次，兼容两类行为。
+    focus_and_type_query()
+    press_enter()
     log_event(
         "sogou_recovery_submitted",
         account=account_name,
         query="搜一搜",
-        source="wechat-main-window",
+        source="wechat-main-window-keyboard",
     )
-    deadline = time.time() + 8
-    while time.time() < deadline:
-        time.sleep(0.4)
-        try:
-            window = find_sogou_search_window(excluded_hwnds)
-            log_event("sogou_recovery_succeeded", account=account_name, hwnd=window.hwnd)
-            return window
-        except RuntimeError:
-            continue
+    # AppEx 首次启动和本地 OCR 模型预热都可能耗时十余秒；等待期间只做
+    # 页面复核，不重复发送打开动作，避免慢机器上产生多个搜一搜窗口。
+    recovered = wait_for_search_window(18, "ctrl-f-enter")
+    if recovered is not None:
+        return recovered
 
-    # 某些微信版本回车只关闭候选框，不会打开搜一搜；重新聚焦搜索框，
-    # 用“向下+回车”明确选中第一条候选项，再等待浏览器窗口出现。
-    activate_window(main_window.hwnd)
-    click(
-        main_window.rect.left
-        + round(main_window.rect.width * int(search_box["center_x_1000"]) / 1000),
-        main_window.rect.top
-        + round(main_window.rect.height * int(search_box["center_y_1000"]) / 1000),
-    )
-    press_ctrl_a()
-    press_ctrl_v()
-    press_down()
+    # 当前版本第一次回车后需要点击顶部“搜索网络结果”整行。本地 OCR
+    # 动态定位该行，避免依赖不同分辨率和缩放下的固定坐标。
+    focus_and_type_query()
     press_enter()
-    log_event("sogou_recovery_keyboard_fallback", account=account_name, query="搜一搜")
-    deadline = time.time() + 12
-    while time.time() < deadline:
-        time.sleep(0.4)
-        try:
-            window = find_sogou_search_window(excluded_hwnds)
-            log_event("sogou_recovery_succeeded", account=account_name, hwnd=window.hwnd, method="down-enter")
-            return window
-        except RuntimeError:
-            continue
-    raise RuntimeError("已从微信主窗口提交搜索，但未出现搜一搜浏览器窗口")
+    time.sleep(0.8)
+    screenshot = capture_window(main_window.rect)
+    local_action = PROFILE_OCR.locate_wechat_search_entry(screenshot)
+    log_event(
+        "sogou_recovery_local_detection",
+        account=account_name,
+        found=bool(local_action.get("found")),
+        confidence=local_action.get("confidence"),
+        reason=local_action.get("reason"),
+    )
+    if local_action.get("found"):
+        click(
+            main_window.rect.left
+            + round(main_window.rect.width * int(local_action["center_x_1000"]) / 1000),
+            main_window.rect.top
+            + round(main_window.rect.height * int(local_action["center_y_1000"]) / 1000),
+        )
+        recovered = wait_for_search_window(18, "rapidocr-search-entry")
+        if recovered is not None:
+            return recovered
+
+    # 本地识别或点击未能打开窗口时，才启用 Qwen-VL；模型也必须返回精确标签和安全坐标。
+    vl_reason = "已禁用 Qwen-VL"
+    if allow_vl:
+        if client is None:
+            try:
+                client = QwenVisionClient(QwenVisionConfig.from_env())
+            except RuntimeError as exc:
+                vl_reason = str(exc)
+        if client is not None:
+            try:
+                # 本地点击可能改变候选状态，重新生成可复核的网络搜索入口。
+                focus_and_type_query()
+                press_enter()
+                time.sleep(0.8)
+                screenshot = capture_window(main_window.rect)
+                vl_action = normalize_qwen_wechat_search_entry(
+                    client.detect_wechat_search_entry(screenshot)
+                )
+                vl_reason = str(vl_action.get("reason") or "Qwen-VL 点击后未出现搜一搜窗口")
+                log_event(
+                    "sogou_recovery_vl_detection",
+                    account=account_name,
+                    found=bool(vl_action.get("found")),
+                    confidence=vl_action.get("confidence"),
+                    reason=vl_action.get("reason"),
+                )
+                if vl_action.get("found"):
+                    click(
+                        main_window.rect.left
+                        + round(main_window.rect.width * int(vl_action["center_x_1000"]) / 1000),
+                        main_window.rect.top
+                        + round(main_window.rect.height * int(vl_action["center_y_1000"]) / 1000),
+                    )
+                    recovered = wait_for_search_window(22, "qwen-vl-search-entry")
+                    if recovered is not None:
+                        return recovered
+            except Exception as exc:  # noqa: BLE001
+                vl_reason = f"Qwen-VL 调用失败：{exc}"
+                log_event("sogou_recovery_vl_failed", account=account_name, error=str(exc))
+
+    local_reason = str(local_action.get("reason") or "本地识别点击后未出现窗口")
+    raise RuntimeError(
+        "已执行 Ctrl+F 搜索，但未出现搜一搜浏览器窗口；"
+        f"本地识别：{local_reason}；视觉兜底：{vl_reason}"
+    )
 
 
 def recreate_sogou_search_window(
@@ -619,15 +730,15 @@ def recreate_sogou_search_window(
         },
         action="preserve_stale_window_and_open_new",
     )
-    # 页面 OCR 失败不能证明窗口可以安全销毁。排除旧 HWND，只接受新出现的微信窗口；
-    # 若微信复用旧窗口，则让任务失败并保留用户现场，等待人工处理。
+    # 新版会在原 HWND 内打开搜索标签，不能要求必须产生独立窗口。
+    # open_sogou_from_wechat_main 仍须验证搜一搜证据，旧页面全部保留。
     recovered = open_sogou_from_wechat_main(
         account_name,
-        excluded_hwnds={stale_window.hwnd},
     )
     recovered = arrange_automation_window(recovered, "browser")
     activate_window(recovered.hwnd)
-    press_ctrl_1()
+    if not browser_navigator(recovered, "").select(lambda page: page.role == "search"):
+        press_ctrl_1()
     time.sleep(0.8)
     log_event(
         "search_page_recovery_finished",
@@ -653,6 +764,170 @@ def find_official_profile_window() -> WindowInfo:
     return max(candidates, key=lambda item: item.rect.width * item.rect.height)
 
 
+def observe_browser_page(window: WindowInfo, account: str = "") -> Page:
+    """每次读取新证据，禁止复用 UIA 元素索引或旧截图坐标。"""
+    result = probe_page(window.hwnd)
+    page = page_from_probe(result, account)
+    if not page.key:
+        time.sleep(0.4)
+        page = page_from_probe(probe_page(window.hwnd), account)
+    return page
+
+
+_CLEANED_TAB_SESSIONS: set[str] = set()
+TAB_OWNERSHIP = TabOwnership(Path(__file__).resolve().parent / "output" / "owned-browser-tabs.json")
+_NAVIGATION_CACHES: dict[tuple[str, str], InventoryCache] = {}
+_CUSTOM_TAB_BINDINGS: dict[str, dict[str, tuple]] = {}
+_TAB_PROBE_DIAGNOSTICS: dict[tuple[str, str], tuple] = {}
+
+
+def browser_session(hwnd: int) -> str:
+    """进程 PID 和创建时间共同标识会话，避免 Windows 复用句柄导致误关。"""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    process = kernel32.OpenProcess(0x1000, False, pid.value)
+    if not process:
+        return ""
+    try:
+        stamps = [wintypes.FILETIME() for _ in range(4)]
+        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        if not kernel32.GetProcessTimes(process, *(ctypes.byref(s) for s in stamps)):
+            return ""
+        return f"{pid.value}:{stamps[0].dwHighDateTime}:{stamps[0].dwLowDateTime}:{hwnd}"
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def browser_navigator(window: WindowInfo, account: str) -> Navigator:
+    session = browser_session(window.hwnd)
+    evidence: dict = {}
+    bindings = _CUSTOM_TAB_BINDINGS.setdefault(session, {}) if session else {}
+
+    def current_tab() -> tuple:
+        standard = selected_tab(evidence)
+        if standard:
+            return standard
+        if evidence.get("tab_probe_mode") != "custom-unverified":
+            return ()
+        signature = tab_signature(evidence)
+        page = page_from_probe(evidence, account)
+        if not signature or not page.key:
+            return ()
+        if len(signature) == 1:
+            bindings[page.key] = signature[0][0]
+        identity = bindings.get(page.key, ())
+        return identity if identity in dict(signature) else ()
+
+    def choose_tab(identity: tuple) -> bool:
+        activate_window(window.hwnd)
+        observe()
+        if evidence.get("tab_probe_mode") != "custom-unverified":
+            return select_tab(window.hwnd, identity)
+        matches = [t for t in evidence.get("custom_tabs", []) if tuple(t["id"]) == identity]
+        if len(matches) != 1 or matches[0].get("offscreen"):
+            return False
+        left, top, right, bottom = matches[0]["rect"]
+        if right - left < 60 or bottom - top < 10:
+            return False
+        # 使用刚读取的标签实体位置，点击左侧标题区，避开右侧关闭按钮。
+        click(round(left + (right-left) * 0.3), round((top+bottom)/2))
+        time.sleep(0.4)
+        page = observe()
+        if page.key and identity in dict(tab_signature(evidence)):
+            bindings[page.key] = identity
+            return True
+        return False
+
+    def observe() -> Page:
+        nonlocal evidence
+        # 页面身份和标签列表来自同一次新探测，避免额外启动探测进程。
+        evidence = probe_page(window.hwnd)
+        page = page_from_probe(evidence, account)
+        if not page.key:
+            time.sleep(0.4)
+            evidence = probe_page(window.hwnd)
+            page = page_from_probe(evidence, account)
+        # 同一账号仅在探测类型、数量或可绑定状态变化时记录，避免每次轮询刷屏。
+        standard = evidence.get("tabs") or []
+        custom = evidence.get("custom_tabs") or []
+        state = (bool(evidence.get("ok")), evidence.get("tab_probe_mode", "unknown"),
+                 len(standard), len(custom), bool(tab_signature(evidence)), bool(current_tab()))
+        diagnostic_key = (session or str(window.hwnd), account)
+        if _TAB_PROBE_DIAGNOSTICS.get(diagnostic_key) != state:
+            _TAB_PROBE_DIAGNOSTICS[diagnostic_key] = state
+            log_event("browser_tab_probe", account=account, hwnd=window.hwnd,
+                      probe_ok=state[0], mode=state[1], standard_tab_count=state[2],
+                      custom_tab_count=state[3], signature_valid=state[4], active_tab_bound=state[5])
+        return page
+
+    # 无法确认进程会话时不跨 Navigator 共享，避免 HWND 复用继承旧记录。
+    cache = _NAVIGATION_CACHES.setdefault((session, account), InventoryCache()) if session else InventoryCache()
+    def next_tab() -> None:
+        activate_window(window.hwnd)
+        press_ctrl_tab()
+        time.sleep(0.35)
+
+    def close_tab() -> None:
+        activate_window(window.hwnd)
+        press_ctrl_w()
+        time.sleep(0.5)
+
+    def back() -> None:
+        activate_window(window.hwnd)
+        user32.keybd_event(0x12, 0, 0, 0)  # Alt+Left：同页导航返回。
+        user32.keybd_event(0x25, 0, 0, 0)
+        user32.keybd_event(0x25, 0, 2, 0)
+        user32.keybd_event(0x12, 0, 2, 0)
+        time.sleep(0.8)
+
+    return Navigator(observe, next_tab, close_tab, back,
+                     signature=lambda: tab_signature(evidence), cache=cache,
+                     selected=current_tab, select_tab=choose_tab,
+                     custom_tabs=lambda: evidence.get("tab_probe_mode") == "custom-unverified",
+                     on_reused=lambda old, new: TAB_OWNERSHIP.reuse(session, old, new),
+                     on_created=lambda page: TAB_OWNERSHIP.remember(session, page),
+                     on_closed=lambda page: TAB_OWNERSHIP.forget(session, page),
+                     trace=lambda data: log_event("browser_navigation", account=account, **data))
+
+
+def wait_for_article_page(window: WindowInfo, account: str, title: str, timeout: float = 15) -> Page:
+    """网页文档会先出现空壳，再更新标题和署名；等待身份齐全后才能采集或清理。"""
+    deadline = time.monotonic() + timeout
+    page = Page(window.hwnd, "", "unknown", "")
+    mismatch_key, mismatch_count = "", 0
+    while time.monotonic() < deadline:
+        page = observe_browser_page(window, account)
+        if page.role in {"article", "unknown"} and page.name and titles_match(title, page.name):
+            # 非标准图文可能没有 UIA 日期/署名。此处仅允许进入读取链路，
+            # collect_open_article 仍须校验链接解析出的标题、公众号和前后 URL。
+            return page
+        if page.role == "article" and page.name:
+            mismatch_count = mismatch_count + 1 if page.key == mismatch_key else 1
+            mismatch_key = page.key
+            if mismatch_count >= 3:
+                log_event("article_page_identity_failed", account=account, expected_title=title,
+                          observed_page=page.__dict__, reason="stable_title_mismatch")
+                raise ArticleMismatchError(f"正文标题已稳定但与卡片不匹配：目标={title!r}，实际={page.name!r}")
+        else:
+            mismatch_key, mismatch_count = "", 0
+        time.sleep(0.5)
+    log_event("article_page_identity_failed", account=account, expected_title=title,
+              observed_page=page.__dict__)
+    raise RuntimeError("文章加载后仍未确认目标标题和公众号，保留页面")
+
+
+def find_navigation_browser() -> WindowInfo:
+    """新版当前标签是主页/文章时，也能找到承载它的微信浏览器。"""
+    try:
+        return find_sogou_search_window()
+    except RuntimeError:
+        for window in enumerate_wechat_windows():
+            if window.class_name.startswith("Chrome_WidgetWin_"):
+                if observe_browser_page(window).key:
+                    return window
+        raise
+
+
 def find_account_message_window(account_name: str) -> WindowInfo:
     expected = normalize_title(account_name)
     candidates = [
@@ -664,6 +939,14 @@ def find_account_message_window(account_name: str) -> WindowInfo:
     if not candidates:
         raise RuntimeError(f"没有找到公众号消息窗口：{account_name}")
     return max(candidates, key=lambda item: item.rect.width * item.rect.height)
+
+
+def recover_batch_navigation(account_name: str) -> None:
+    """仅在搜索页身份重新确认后允许批次继续，不以窗口存在代替健康检查。"""
+    browser = find_navigation_browser()
+    if not browser_navigator(browser, "").select(lambda page: page.role == "search"):
+        raise RuntimeError("未找到可确认的搜一搜页面")
+    log_event("batch_navigation_recovered", account=account_name)
 
 
 def close_window(hwnd: int, timeout_seconds: float = 3.0) -> None:
@@ -782,10 +1065,36 @@ def capture_window(rect: Rect) -> Image.Image:
 
 
 def activate_window(hwnd: int) -> None:
-    # 截图前恢复并置前，避免文章窗口或其他应用遮挡公众号列表。
+    """恢复并可靠激活目标窗口；无法置前时停止，避免向其他应用误发按键。"""
     user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.BringWindowToTop(hwnd)
     user32.SetForegroundWindow(hwnd)
-    time.sleep(0.8)
+    time.sleep(0.2)
+    if int(user32.GetForegroundWindow()) != int(hwnd):
+        foreground_hwnd = int(user32.GetForegroundWindow())
+        current_thread = int(kernel32.GetCurrentThreadId())
+        target_thread = int(user32.GetWindowThreadProcessId(hwnd, None))
+        foreground_thread = (
+            int(user32.GetWindowThreadProcessId(foreground_hwnd, None))
+            if foreground_hwnd
+            else 0
+        )
+        attached_threads: list[int] = []
+        try:
+            # Windows 会限制后台进程抢占前台；临时绑定输入队列后再置前。
+            for thread_id in {target_thread, foreground_thread}:
+                if thread_id and thread_id != current_thread:
+                    if user32.AttachThreadInput(current_thread, thread_id, True):
+                        attached_threads.append(thread_id)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetFocus(hwnd)
+        finally:
+            for thread_id in reversed(attached_threads):
+                user32.AttachThreadInput(current_thread, thread_id, False)
+    time.sleep(0.6)
+    if int(user32.GetForegroundWindow()) != int(hwnd):
+        raise RuntimeError(f"无法将微信窗口置于前台，已停止发送按键：hwnd={hwnd}")
 
 
 def _tab_switch_difference(before: Image.Image, after: Image.Image) -> float:
@@ -803,13 +1112,32 @@ def _tab_switch_difference(before: Image.Image, after: Image.Image) -> float:
 
 
 def _inspect_sogou_search_results(screenshot: Image.Image) -> dict[str, Any]:
-    """同时验证搜索框与“账号”导航，避免把文章分享弹窗误认成搜一搜。"""
+    """验证搜索框与账号导航；横向滚动隐藏一级导航时复核二级筛选栏。"""
     search_box = PROFILE_OCR.locate_search_box(screenshot)
     account_tab = PROFILE_OCR.locate_account_tab(screenshot)
+    account_filters = False
+    if search_box.get("found") and not account_tab.get("found"):
+        width, height = screenshot.size
+        # 必须同时出现一组账号筛选项，不能把正文里单独的“公众号”当成导航。
+        rows = [
+            row for row in PROFILE_OCR._rows(screenshot)
+            if height * 0.10 <= row["center_y"] <= height * 0.30
+            and row["center_x"] < width * 0.65
+        ]
+        labels = ("不限", "小程序", "公众号", "服务号", "视频号")
+        for anchor in rows:
+            line = "".join(
+                row["normalized"] for row in rows
+                if abs(row["center_y"] - anchor["center_y"]) <= height * 0.015
+            )
+            if "公众号" in line and sum(label in line for label in labels) >= 3:
+                account_filters = True
+                break
     return {
-        "found": bool(search_box.get("found") and account_tab.get("found")),
+        "found": bool(search_box.get("found") and (account_tab.get("found") or account_filters)),
         "search_box": search_box,
         "account_tab": account_tab,
+        "account_filters": {"found": account_filters},
     }
 
 
@@ -1112,6 +1440,8 @@ def arrange_automation_window(window: WindowInfo, role: str) -> WindowInfo:
         window.class_name,
         actual,
         window.process_name,
+        window.shared_browser,
+        window.profile_checkpoint,
     )
     log_event(
         "window_arranged",
@@ -1142,6 +1472,38 @@ def click(screen_x: int, screen_y: int) -> None:
     user32.SetCursorPos(screen_x, screen_y)
     user32.mouse_event(0x0002, 0, 0, 0, 0)
     user32.mouse_event(0x0004, 0, 0, 0, 0)
+
+
+def press_ctrl_shift_r() -> None:
+    """强制重新请求文章正文，避免页面预加载导致抓包缓存缺失。"""
+    try:
+        for key in (0x11, 0x10, 0x52):
+            user32.keybd_event(key, 0, 0, 0)
+    finally:
+        for key in (0x52, 0x10, 0x11):
+            user32.keybd_event(key, 0, 0x0002, 0)
+
+
+def acquire_network_metrics(directory: str, page: dict, hwnd: int):
+    """先等待在途响应，再刷新一次；刷新后只接受新请求产生的统计。"""
+    record, reason = read_snapshot(directory, page)
+    if record is not None or reason == "missing_article_identity":
+        return record, reason
+    for _ in range(6):
+        time.sleep(0.5)
+        record, reason = read_snapshot(directory, page)
+        if record is not None:
+            return record, reason
+    activate_window(hwnd)
+    refreshed_at = time.time()
+    press_ctrl_shift_r()
+    log_event("article_network_refresh", article_id=page.get("network_article_id"))
+    for _ in range(30):
+        time.sleep(0.5)
+        record, reason = read_snapshot(directory, page)
+        if record is not None and record.get("captured_at", 0) >= refreshed_at:
+            return record, "hit_after_refresh"
+    return None, "refresh_timeout:" + reason
 
 
 def press_ctrl_end() -> None:
@@ -1516,11 +1878,28 @@ def canonical_title_for_match(value: str) -> str:
     )
 
 
+def parse_article_with_retry(url: str, **kwargs) -> dict:
+    """临时空响应在原页面内重试，不重复打开文章或放宽身份验证。"""
+    for attempt in range(1, 4):
+        try:
+            return parse_page(url, **kwargs)
+        except ValueError as exc:
+            if str(exc) not in {"文章页面没有标题", "文章正文为空，拒绝写入 MongoDB"}:
+                raise
+            log_event("article_parse_incomplete", attempt=attempt, reason=str(exc),
+                      exhausted=attempt == 3)
+            if attempt == 3:
+                raise
+            time.sleep(attempt)
+
+
 def titles_match(expected: str, actual: str) -> bool:
     expected_value = normalize_title(expected)
     actual_value = normalize_title(actual)
     expected_canonical = canonical_title_for_match(expected_value)
     actual_canonical = canonical_title_for_match(actual_value)
+    if not expected_canonical or not actual_canonical:
+        return False  # 互动数被去掉后是空字符串，不能把空标题视作匹配。
     truncated = expected_value.rstrip(".…")
     if expected_value.endswith(("...", "…")):
         truncated_canonical = canonical_title_for_match(truncated)
@@ -1626,6 +2005,7 @@ def collect_open_article(
     successful_urls_in_run: set[str] | None = None,
     metric_mode: str = "all",
     scan_range: str | None = None,
+    article_window: WindowInfo | None = None,
 ) -> dict[str, Any]:
     log_event(
         "article_collect_started",
@@ -1633,7 +2013,7 @@ def collect_open_article(
         expected_account=expected_account,
         metric_mode=metric_mode,
     )
-    hwnd, rect = find_article_window()
+    hwnd, rect = (article_window.hwnd, article_window.rect) if article_window else find_article_window()
     activate_window(hwnd)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1678,7 +2058,23 @@ def collect_open_article(
                 log_event("article_page_reused_from_mongo", url=url)
         except Exception as exc:
             log_event("article_cache_lookup_failed", url=url, error=str(exc))
-    page = cached_page or parse_page(url)
+    network_directory = os.getenv("WECHAT_CAPTURE_CACHE_DIR", "").strip() if metric_mode == "share" else ""
+    network_strict = os.getenv("WECHAT_CAPTURE_MODE", "prefer").strip().lower() == "strict"
+    if network_strict and not network_directory:
+        raise RuntimeError("仅抓包模式需要配置缓存目录并选择仅转发数")
+    # 网络模式需要最终响应的文章 ID，不能仅凭 Mongo 中缓存的标题关联统计。
+    if network_directory:
+        try:
+            page = parse_article_with_retry(url, include_network_identity=True)
+        except Exception:
+            if not cached_page:
+                raise
+            # 解析最终地址失败时仍可使用已有正文，但不允许复用旧网络身份。
+            page = dict(cached_page)
+            page.pop("network_article_id", None)
+            log_event("article_network_identity_unavailable", action="fallback_to_ui")
+    else:
+        page = cached_page or parse_article_with_retry(url)
     log_event(
         "article_page_parsed",
         url=url,
@@ -1697,6 +2093,10 @@ def collect_open_article(
         )
     publish_time = page.get("publish_time") or page.get("publishDate")
     if scan_range and not publish_time_matches_scan_range(publish_time, scan_range):
+        # 跳过统计和写库不代表跳过身份确认，图片消息清理同样需要 URL 稳定证据。
+        url_after = copy_article_url(hwnd, rect, output_dir, "after", client=client, allow_vl=allow_vl)
+        if url_after != url:
+            raise ArticleMismatchError("跳过旧文章期间活动标签发生变化，拒绝确认清理身份")
         # 资料页时间分组只用于初筛；真正写库前必须以文章页面的发布时间为准。
         # 这样即使 OCR 把旧卡片错误归到“今天”，也不会更新历史文章互动数。
         log_event(
@@ -1713,7 +2113,16 @@ def collect_open_article(
             "publish_time": publish_time,
             "status": "skipped_outside_scan_range",
             "skip_reason": f"真实发布时间 {publish_time} 不属于扫描范围 {scan_range}",
+            "verification": {"url_before": url, "url_after": url_after, "url_stable": True,
+                             "title_matched": True, "account_matched": True},
         }
+    network_record = None
+    if network_directory:
+        network_record, network_reason = acquire_network_metrics(network_directory, page, hwnd)
+        log_event("article_network_metrics_lookup", status=network_reason)
+        if network_record is None and network_strict:
+            # 必须在视觉模型兜底的 try 块外抛出，禁止严格模式静默转为 OCR/VL。
+            raise RuntimeError("仅抓包采集失败：" + network_reason)
     evidence_screenshot = capture_window(rect)
     evidence_screenshot.save(output_dir / "article_evidence.png")
     evidence = ARTICLE_EVIDENCE_OCR.inspect(evidence_screenshot, page["title"])
@@ -1730,7 +2139,7 @@ def collect_open_article(
     # 因此正文/标签页 OCR 只记录辅助证据，不因误识别而重复打开文章。
     viewport_matched = bool(viewport_title) and titles_match(viewport_title, page["title"])
     tab_matched = bool(tab_title) and titles_match(tab_title, page["title"])
-    if not viewport_matched or not tab_matched:
+    if not viewport_matched:
         log_event(
             "article_title_evidence_warning",
             parsed_title=page.get("title"),
@@ -1757,9 +2166,15 @@ def collect_open_article(
     article_footer.save(output_dir / "article_footer.png")
     metric_source = "template-ocr-share-only" if metric_mode == "share" else "template-ocr"
     try:
-        bottom_metrics, metric_source, partial_reason = extract_local_interaction_metrics(
-            evidence_screenshot, metric_mode, allow_partial=not allow_vl
-        )
+        picture_count = picture_share_count(probe_page(hwnd), page["account_name"], page["title"]) if metric_mode == "share" and network_record is None else None
+        if network_record is not None:
+            bottom_metrics, metric_source, partial_reason = {"share_count": network_record["share_count"]}, "network-response-share", None
+        elif picture_count is not None:
+            bottom_metrics, metric_source, partial_reason = {"share_count": picture_count}, "uia-picture-share", None
+        else:
+            bottom_metrics, metric_source, partial_reason = extract_local_interaction_metrics(
+                evidence_screenshot, metric_mode, allow_partial=not allow_vl
+            )
         if partial_reason:
             log_event(
                 "article_metrics_partial",
@@ -1856,6 +2271,13 @@ def safe_path_name(value: str) -> str:
 def classify_collection_error(error: BaseException) -> str:
     """把采集异常归类，便于失败队列按类型重试和统计。"""
     text = str(error).lower()
+    if any(marker in text for marker in ("页面跳转归属", "标签清理失败", "返回后未找到",
+                                         "标签遍历", "导航上限", "无法确认当前页面")):
+        return "navigation_return"
+    if "未确认目标标题和公众号" in text:
+        return "article_identity"
+    if "搜一搜连续" in text and "未出现搜一搜" in text:
+        return "search_recovery"
     if "未找到可确认的同名公众号" in text or "没有精确匹配名称" in text:
         return "account_not_found"
     if "筛选未确认选中" in text or "二级公众号筛选" in text:
@@ -2182,7 +2604,7 @@ def search_and_open_profile(
         alias_applied=search_name != account_name,
     )
     try:
-        search_window = find_sogou_search_window()
+        search_window = find_navigation_browser()
     except RuntimeError as exc:
         log_event(
             "sogou_window_missing",
@@ -2190,7 +2612,11 @@ def search_and_open_profile(
             reason=str(exc),
             action="recover_from_wechat_main_window",
         )
-        search_window = open_sogou_from_wechat_main(account_name)
+        search_window = open_sogou_from_wechat_main(
+            account_name,
+            client=client,
+            allow_vl=allow_vl,
+        )
         # 明确记录自动恢复已完成，控制台日志可区分“已自愈”与“仍然缺少搜一搜窗口”。
         log_event(
             "sogou_window_recovered",
@@ -2200,8 +2626,15 @@ def search_and_open_profile(
         )
     search_window = arrange_automation_window(search_window, "browser")
     activate_window(search_window.hwnd)
-    # 正常情况下搜一搜位于首标签；若远端电脑曾中断或人工改过标签顺序，先动态找回并归位。
-    press_ctrl_1()
+    session = browser_session(search_window.hwnd)
+    if session and session not in _CLEANED_TAB_SESSIONS:
+        closed = TAB_OWNERSHIP.cleanup(session, browser_navigator(search_window, ""))
+        _CLEANED_TAB_SESSIONS.add(session)
+        log_event("owned_tabs_cleanup", closed=closed)
+    # 新版搜索页不保证是首标签，先按页面身份定位，禁止重排用户标签。
+    semantic_search = browser_navigator(search_window, "").select(lambda page: page.role == "search")
+    if not semantic_search:
+        press_ctrl_1()  # 旧版无 UIA 文档时继续使用已有 OCR 兼容路径。
     time.sleep(0.6)
     output_dir.mkdir(parents=True, exist_ok=True)
     search_box: dict[str, Any] = {"found": False}
@@ -2246,7 +2679,8 @@ def search_and_open_profile(
             continue
         # 只重复回到首标签并等待页面稳定，禁止盲目 Ctrl+W 误关搜索页。
         activate_window(search_window.hwnd)
-        press_ctrl_1()
+        if not semantic_search:
+            press_ctrl_1()
         press_escape()
         time.sleep(0.5)
     if before is not None:
@@ -2254,7 +2688,7 @@ def search_and_open_profile(
     if not search_box.get("found"):
         raise RuntimeError(str(search_box.get("reason") or "无法定位搜一搜搜索框"))
     # 每个账号开始前清掉遗留文章标签；此后始终保持“搜索页 + 当前文章”最多两个标签。
-    keep_only_search_tab(search_window, account_name, output_dir)
+    # 第二代浏览器中主页也是标签，保留原有页面，不执行全量标签清理。
     before = capture_window(search_window.rect)
     search_box = PROFILE_OCR.locate_search_box(before)
     if not search_box.get("found"):
@@ -2419,12 +2853,7 @@ def search_and_open_profile(
     if not target.get("found"):
         raise RuntimeError(str(target.get("reason") or "搜一搜没有精确匹配公众号"))
 
-    # 关闭上一个账号的资料窗口，确保后续校验的是本次点击新打开的窗口。
-    try:
-        previous = find_official_profile_window()
-        close_window(previous.hwnd)
-    except RuntimeError:
-        pass
+    # 保留用户已有资料窗口；新主页必须通过目标名称与页面结构验证。
     activate_window(search_window.hwnd)
     name_click_x = search_window.rect.left + round(
         search_window.rect.width * int(target["center_x_1000"]) / 1000
@@ -2432,6 +2861,13 @@ def search_and_open_profile(
     name_click_y = search_window.rect.top + round(
         search_window.rect.height * int(target["center_y_1000"]) / 1000
     )
+    # 搜索 OCR 会把“媒体/事业单位”或标点并入 matched_name；这些文本只用于
+    # 搜索结果定位，主页身份必须使用配置的搜索名（包含明确配置的账号别名）。
+    expected_profile_name = search_name
+    profile_checkpoint = None
+    if observe_browser_page(search_window).role == "search":
+        profile_checkpoint = browser_navigator(search_window, "").capture(expected_profile_name)
+    existing_hwnds = {w.hwnd for w in enumerate_wechat_windows()}
     click(name_click_x, name_click_y)
     log_event(
         "profile_name_clicked",
@@ -2463,8 +2899,18 @@ def search_and_open_profile(
     last_reason = ""
     arranged_profile_hwnds: set[int] = set()
     while time.time() < deadline:
+        shared_page = observe_browser_page(search_window, expected_profile_name)
+        if shared_page.role == "profile":
+            if profile_checkpoint:
+                browser_navigator(search_window, expected_profile_name).track_created(profile_checkpoint)
+            log_event("profile_opened_and_verified", account=account_name,
+                      navigation_mode="shared-browser", page_name=shared_page.name)
+            return WindowInfo(search_window.hwnd, search_window.title, search_window.class_name,
+                              search_window.rect, search_window.process_name, True, profile_checkpoint), shared_page.name
         try:
             profile = find_official_profile_window()
+            if profile.hwnd in existing_hwnds:
+                raise RuntimeError("尚未出现本次打开的独立资料窗口")
             if profile.hwnd not in arranged_profile_hwnds:
                 profile = arrange_automation_window(profile, "profile")
                 arranged_profile_hwnds.add(profile.hwnd)
@@ -2478,7 +2924,7 @@ def search_and_open_profile(
             if validation.get("matched"):
                 log_event("profile_opened_and_verified", account=account_name, validation=validation)
                 # 后续正文页严格校验微信实际展示的名称，避免“库内别名”导致误报。
-                return profile, str(target.get("matched_name") or target.get("name") or account_name)
+                return profile, expected_profile_name
             last_reason = str(validation.get("reason") or "资料窗口名称不匹配")
             header_image.save(output_dir / "profile-header-mismatch.png")
             if avatar_retry_done and allow_vl and client is not None and not vl_header_checked:
@@ -2521,7 +2967,8 @@ def search_and_open_profile(
                         local_reason=last_reason,
                         error=str(exc),
                     )
-            if not avatar_retry_done and time.time() >= avatar_retry_at:
+            if (not avatar_retry_done and time.time() >= avatar_retry_at
+                    and shared_page.role == "search"):
                 # 名称区域在部分微信版本中只会选中文字，未必打开资料页。此时先关闭
                 # 不匹配的旧资料窗口，再点击同一卡片头像，确保下一次校验对应本次账号。
                 try:
@@ -2547,7 +2994,8 @@ def search_and_open_profile(
                 )
         except RuntimeError as exc:
             last_reason = str(exc)
-            if not avatar_retry_done and time.time() >= avatar_retry_at:
+            if (not avatar_retry_done and time.time() >= avatar_retry_at
+                    and shared_page.role == "search"):
                 # 某些版本只有头像或整张卡片响应点击，名称链接本身可能不触发资料窗口。
                 activate_window(search_window.hwnd)
                 avatar_x = search_window.rect.left + round(
@@ -2568,6 +3016,70 @@ def search_and_open_profile(
     raise RuntimeError(f"点击搜一搜结果后未打开正确公众号资料窗口：{last_reason}")
 
 
+def profile_feed_from_uia(window: WindowInfo, account: str = "") -> dict[str, Any]:
+    rect = window.rect
+    return feed_from_probe(probe_page(window.hwnd), (rect.left, rect.top, rect.right, rect.bottom), account)
+
+
+def locate_profile_article(window: WindowInfo, account: str, title: str, time_group: str) -> tuple[int, int]:
+    """返回列表后按标题与日期重找锚点，最多六次滚动恢复，不复用旧坐标。"""
+    for _ in range(7):
+        payload = probe_page(window.hwnd)
+        rect = window.rect
+        feed = feed_from_probe(payload, (rect.left, rect.top, rect.right, rect.bottom), account)
+        matches = [card for card in feed["articles"]
+                   if titles_match(title, card["title"]) and card.get("time_group") == time_group]
+        if len(matches) == 1:
+            return matches[0]["screen_point"]
+        if len(matches) > 1:
+            raise RuntimeError("同一日期存在多个匹配标题，拒绝猜测文章")
+        rows = [row for doc in payload.get("documents", []) for row in doc.get("rows", [])
+                if titles_match(title, row.get("text", ""))]
+        if len(rows) != 1:
+            break
+        y = (rows[0]["rect"][1] + rows[0]["rect"][3]) / 2
+        if y < rect.top + 60:
+            scroll_window_up(rect)
+        elif y >= rect.bottom:
+            scroll_window_down(rect)
+        else:
+            break
+        time.sleep(0.4)
+    # 列表初筛可能来自 OCR；UIA 缺少对应卡片时，用当前截图重新定位同一日期的唯一标题。
+    identity = page_from_probe(probe_page(window.hwnd), account)
+    if identity.role == "profile":
+        try:
+            fresh = PROFILE_OCR.inspect_profile_feed(capture_window(window.rect))
+            point = locate_ocr_card(fresh, title, time_group, window.rect)
+            if point and page_from_probe(probe_page(window.hwnd), account) == identity:
+                log_event("article_anchor_recovered", account=account, title=title, method="fresh-profile-ocr")
+                return point
+        except (ValueError, KeyError, TypeError) as exc:
+            log_event("article_anchor_ocr_failed", account=account, error=type(exc).__name__)
+    raise RuntimeError("无法恢复目标文章的列表位置，已停止使用旧坐标")
+
+
+def locate_ocr_card(feed: dict, title: str, time_group: str, rect: Rect) -> tuple[int, int] | None:
+    """仅使用新截图上的日期标签和卡片坐标，缺日期、标题过短或多匹配均拒绝点击。"""
+    if len(canonical_title_for_match(title)) < 5:
+        return None
+    events = [(int(r["center_y_1000"]), "date", r) for r in feed.get("time_labels", [])]
+    events += [(int(r["center_y_1000"]), "article", r) for r in feed.get("articles", [])]
+    group, matches = "", []
+    for y, kind, row in sorted(events, key=lambda item: item[0]):
+        if kind == "date":
+            group = row.get("text", "")
+        elif (normalize_title(group) == normalize_title(time_group)
+              and titles_match(title, row.get("title", ""))):
+            x = int(row["center_x_1000"])
+            if 0 < x < 1000 and 0 < y < 1000:
+                matches.append((rect.left + round(rect.width * x / 1000),
+                                rect.top + round(rect.height * y / 1000)))
+    if len(matches) > 1:
+        raise RuntimeError("同一日期存在多个匹配标题，拒绝猜测文章")
+    return matches[0] if matches else None
+
+
 def analyze_profile_window(
     profile_window: WindowInfo,
     output_dir: Path,
@@ -2586,6 +3098,14 @@ def analyze_profile_window(
         press_ctrl_home()
         time.sleep(0.8)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if profile_window.shared_browser:
+        try:
+            structured = profile_feed_from_uia(profile_window)
+            if structured["articles"]:
+                (output_dir / "feed.json").write_text(json.dumps(structured, ensure_ascii=False), encoding="utf-8")
+                return structured
+        except RuntimeError as exc:
+            log_event("profile_uia_fallback", reason=str(exc))
     screenshot: Image.Image | None = None
     feed: dict[str, Any] | None = None
     local_failure_reason = ""
@@ -2830,7 +3350,10 @@ def build_card_title_signature(time_group: str, article: dict[str, Any]) -> tupl
     """生成本轮终态去重指纹；互动数缺失时仍可阻止同一卡片重复打开。"""
     # 去除省略号、引号和 OCR 常见 AI/Al 差异，避免同一卡片在相邻屏幕中
     # 仅因展示截断不同而被重复打开。
-    title = canonical_title_for_match(str(article.get("title") or ""))
+    raw_title = str(article.get("title") or "")
+    title = canonical_title_for_match(raw_title)
+    if ("…" in raw_title or "..." in raw_title) and len(title) < 6:
+        return None  # 例如“背....”，不能当作可唯一定位的文章标题。
     group = normalize_title(time_group)
     return (group, title) if group and title else None
 
@@ -3077,6 +3600,8 @@ def collect_profile_account(
     successful_card_signatures: set[tuple[str, str, int, int]] = set()
     # 同一标题卡片无论成功、跳过还是三次失败，达到终态后本轮都不再重复打开。
     terminal_card_title_signatures: set[tuple[str, str]] = set()
+    observed_title_signatures: set[tuple[str, str]] = set()
+    invalid_title_signatures: set[tuple[str, str]] = set()
     successful_urls: set[str] = set()
     skipped_card_duplicate_count = 0
     skipped_terminal_duplicate_count = 0
@@ -3198,7 +3723,21 @@ def collect_profile_account(
                     out_of_range_card_count += 1
                     continue
                 title = str(event.get("title") or "").strip()
-                detected_count += 1
+                title_signature = build_card_title_signature(current_group, event)
+                if title_signature is None:
+                    # 无效卡片在点击前终止；按原始文本留痕，不能用空标题做终态去重。
+                    invalid_signature = (current_group, re.sub(r"\s+", "", title))
+                    if invalid_signature not in invalid_title_signatures:
+                        invalid_title_signatures.add(invalid_signature)
+                        failure = {"account": account_name, "title": title,
+                                   "error": "卡片未提取到有效标题，已跳过点击", "category": "card_identity"}
+                        failures.append(failure)
+                        append_failure_queue(output_dir, failure)
+                        log_event("article_card_invalid", **failure)
+                    continue
+                if title_signature not in observed_title_signatures:
+                    observed_title_signatures.add(title_signature)
+                    detected_count += 1
                 reason = promotion_reason(title)
                 if reason:
                     promotion_card_count += 1
@@ -3240,6 +3779,11 @@ def collect_profile_account(
                 article_dir = output_dir / f"article-{opened_count:02d}-{safe_path_name(title)}"
                 last_error = ""
                 for article_attempt in range(1, 4):
+                    navigation = None
+                    checkpoint = None
+                    article_target = None
+                    owned_article_window = False
+                    baseline_hwnds = set()
                     try:
                         log_event(
                             "article_open_attempt",
@@ -3251,8 +3795,29 @@ def collect_profile_account(
                             list_like_count=event.get("list_like_count"),
                         )
                         activate_window(profile_window.hwnd)
-                        click(*event["screen_point"])
+                        if profile_window.shared_browser:
+                            navigation = browser_navigator(profile_window, observed_account_name)
+                            checkpoint = navigation.checkpoint()
+                            baseline_hwnds = {w.hwnd for w in enumerate_wechat_windows()}
+                            # 从当前页面重新定位标题，返回后的滚动变化不能沿用旧坐标。
+                            point = locate_profile_article(profile_window, observed_account_name, title, current_group)
+                        else:
+                            point = event["screen_point"]
+                        click(*point)
                         time.sleep(2.5)
+                        if navigation:
+                            new_windows = [w for w in enumerate_wechat_windows() if w.hwnd not in baseline_hwnds]
+                            verified = [w for w in new_windows
+                                        if observe_browser_page(w, observed_account_name).role == "article"]
+                            if len(verified) == 1:
+                                article_target = verified[0]
+                                owned_article_window = True
+                            elif not new_windows:
+                                wait_for_article_page(profile_window, observed_account_name, title)
+                                article_target = profile_window
+                                navigation.track_created(checkpoint)
+                            else:
+                                raise RuntimeError("点击后未唯一确认同一公众号的文章页")
                         record = collect_open_article(
                             client,
                             article_dir,
@@ -3273,7 +3838,24 @@ def collect_profile_account(
                             successful_urls_in_run=successful_urls,
                             metric_mode=metric_mode,
                             scan_range=scan_range,
+                            article_window=article_target,
                         )
+                        verification = record.get("verification") or {}
+                        if (navigation and article_target.hwnd == profile_window.hwnd
+                                and all(verification.get(key) for key in ("title_matched", "account_matched", "url_stable"))):
+                            # 已通过链接解析的公众号/标题校验，为非标准文章补充身份。
+                            # 只绑定当前文档 key；后续跳转或标题变化立即使这份证据失效。
+                            confirmed = observe_browser_page(article_target, observed_account_name)
+                            if confirmed.role == "unknown" and titles_match(title, confirmed.name):
+                                original_observe = navigation.observe
+                                def observe_validated(original=original_observe, evidence=confirmed):
+                                    current = original()
+                                    if current == evidence:
+                                        return Page(current.hwnd, current.key, "article", current.name, observed_account_name)
+                                    return current
+                                navigation.observe = observe_validated
+                                log_event("article_page_identity_validated_by_url", account=account_name,
+                                          page=confirmed.__dict__)
                         if record.get("status") == "skipped_outside_scan_range":
                             skipped.append(
                                 {
@@ -3335,12 +3917,41 @@ def collect_profile_account(
                             error=last_error,
                         )
                         article_dir.mkdir(parents=True, exist_ok=True)
+                        if navigation:
+                            try:
+                                diagnostic = probe_page(profile_window.hwnd)
+                                (article_dir / f"attempt-{article_attempt}-page.json").write_text(
+                                    json.dumps(diagnostic, ensure_ascii=False, default=str), encoding="utf-8")
+                                capture_window(profile_window.rect).save(article_dir / f"attempt-{article_attempt}-failed.png")
+                            except Exception as diagnostic_error:
+                                log_event("navigation_diagnostic_failed", error=str(diagnostic_error))
                         (article_dir / f"attempt-{article_attempt}-error.txt").write_text(
                             last_error, encoding="utf-8"
                         )
+                        if isinstance(exc, ArticleMismatchError) or "多个匹配标题" in last_error or "无法恢复目标文章的列表位置" in last_error:
+                            # 身份歧义不是加载超时，重试同一坐标不会得到可靠身份。
+                            failure = {"account": account_name, "title": title,
+                                       "error": last_error, "category": "card_identity"}
+                            failures.append(failure)
+                            append_failure_queue(output_dir, failure)
+                            terminal_card_title_signatures.add(title_signature)
+                            log_event("article_card_failed_terminal", **failure)
+                            break
                     finally:
                         try:
-                            close_article_after_attempt(account_name, title)
+                            if navigation and checkpoint:
+                                if owned_article_window:
+                                    if observe_browser_page(article_target, observed_account_name).role != "article":
+                                        raise RuntimeError("独立文章窗身份变化，拒绝关闭")
+                                    close_window(article_target.hwnd)
+                                    activate_window(profile_window.hwnd)
+                                method = navigation.restore(checkpoint)
+                                log_event("article_return_preserved" if method == "preserved_unknown" else "article_return_verified", account=account_name,
+                                          title=title, method=method)
+                                if method == "preserved_unknown":
+                                    raise RuntimeError("页面跳转归属不确定，已返回原列表并保留异常页，停止本公众号")
+                            elif not profile_window.shared_browser:
+                                close_article_after_attempt(account_name, title)
                         except Exception as cleanup_exc:
                             log_event(
                                 "article_tab_cleanup_failed",
@@ -3378,7 +3989,19 @@ def collect_profile_account(
             scroll_window_down(profile_window.rect)
             time.sleep(0.8)
     finally:
-        if profile_window and user32.IsWindow(profile_window.hwnd):
+        propagating_error = sys.exc_info()[0] is not None
+        if profile_window and profile_window.shared_browser and profile_window.profile_checkpoint:
+            # 只清理由本次搜索打开的主页；用户原有主页与共享浏览器均保留。
+            try:
+                activate_window(profile_window.hwnd)
+                method = browser_navigator(profile_window, "").restore(profile_window.profile_checkpoint)
+                log_event("profile_return_preserved" if method == "preserved_unknown" else "profile_return_verified",
+                          account=account_name, method=method)
+            except RuntimeError as cleanup_error:
+                log_event("profile_return_failed", account=account_name, reason=str(cleanup_error))
+                if not propagating_error:
+                    raise
+        if profile_window and not profile_window.shared_browser and user32.IsWindow(profile_window.hwnd):
             close_window(profile_window.hwnd)
 
     summary = {
@@ -3589,6 +4212,13 @@ def main() -> None:
     WINDOW_LAYOUT_MODE = args.window_layout
     log_path = configure_run_logging(Path(args.output_dir))
     log_event("run_started", argv=os.sys.argv, output_dir=args.output_dir, log_path=str(log_path))
+    log_event("runtime_identity", **runtime_identity(__file__))
+    log_event("network_capture_configuration",
+              enabled=bool(os.getenv("WECHAT_CAPTURE_CACHE_DIR", "").strip()) and args.metrics == "share",
+              mode=os.getenv("WECHAT_CAPTURE_MODE", "prefer"),
+              cache_directory=os.getenv("WECHAT_CAPTURE_CACHE_DIR", ""),
+              metric_mode=args.metrics,
+              note="配置启用不代表代理已连通，以实际响应命中为准")
     if args.local_only:
         # 严格本地模式不要求配置 API Key，且所有可能调用 VL 的分支都会被禁止。
         client = QwenVisionClient(QwenVisionConfig(base_url="", api_key=""))
@@ -3681,6 +4311,16 @@ def main() -> None:
                     category,
                 )
                 summaries.append(fatal_summary)
+                if args.discovery_mode == "sogou-profile" and category in {"navigation_return", "search_recovery"}:
+                    # 浏览器未恢复时停止整批，避免对后续账号重复执行同一失败链路。
+                    try:
+                        recover_batch_navigation(account_name)
+                    except RuntimeError as recovery_error:
+                        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+                        (Path(args.output_dir) / "batch-summary.json").write_text(
+                            json.dumps(summaries, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+                        log_event("batch_navigation_blocked", account=account_name, error=str(recovery_error))
+                        raise RuntimeError("浏览器导航未恢复，已停止本轮并保存结果；恢复搜一搜后重试") from recovery_error
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         (Path(args.output_dir) / "batch-summary.json").write_text(
             json.dumps(summaries, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
@@ -3694,7 +4334,7 @@ def main() -> None:
         log_event(
             "run_finished",
             accounts_total=len(account_names),
-            accounts_failed=sum(1 for summary in summaries if summary.get("fatal_error")),
+            accounts_failed=sum(1 for summary in summaries if summary.get("fatal_error") or summary.get("failures")),
             articles_collected=len(collected_records),
             articles_inserted=sum(
                 1 for record in collected_records if record.get("status") == "inserted"

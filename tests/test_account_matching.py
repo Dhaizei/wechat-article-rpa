@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import unittest
-import json
-import tempfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from PIL import Image
 
 from wechat_profile_ocr import WeChatProfileOCR, _account_name_match
-from wechat_visual_rpa import classify_collection_error, resolve_search_account_name
+from wechat_visual_rpa import (
+    classify_collection_error,
+    resolve_search_account_name,
+)
 
 
 class AccountMatchingTests(unittest.TestCase):
@@ -46,17 +48,23 @@ class AccountMatchingTests(unittest.TestCase):
         self.assertEqual(method, "")
 
     def test_alias_only_changes_the_search_name(self) -> None:
-        # 开源包不携带用户私有的别名配置，测试时使用临时夹具验证解析逻辑。
-        with tempfile.TemporaryDirectory() as tmp:
-            alias_path = Path(tmp) / "account_aliases.json"
-            alias_path.write_text(
-                json.dumps({"通义千问Qwen": "千问大模型", "通义大模型": "千问大模型"}, ensure_ascii=False),
+        # 测试自带临时别名，避免依赖被 Git 忽略的本机配置文件。
+        with TemporaryDirectory() as temp_dir:
+            aliases_path = Path(temp_dir) / "account_aliases.json"
+            aliases_path.write_text(
+                '{"通义千问Qwen": "千问大模型", "通义大模型": "千问大模型"}',
                 encoding="utf-8",
             )
-            with patch("wechat_visual_rpa.ACCOUNT_ALIASES_PATH", alias_path):
-                self.assertEqual(resolve_search_account_name("通义千问Qwen"), "千问大模型")
-                self.assertEqual(resolve_search_account_name("通义大模型"), "千问大模型")
-                self.assertEqual(resolve_search_account_name("不存在的账号"), "不存在的账号")
+            with patch("wechat_visual_rpa.ACCOUNT_ALIASES_PATH", aliases_path):
+                self.assertEqual(
+                    resolve_search_account_name("通义千问Qwen"), "千问大模型"
+                )
+                self.assertEqual(
+                    resolve_search_account_name("通义大模型"), "千问大模型"
+                )
+                self.assertEqual(
+                    resolve_search_account_name("不存在的账号"), "不存在的账号"
+                )
 
     def test_verified_identity_suffix_is_accepted(self) -> None:
         matched, method = _account_name_match("书生Intern", "书生Intern事业单位")

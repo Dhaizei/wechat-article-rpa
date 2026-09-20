@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html
 import json
 import os
 import re
@@ -146,24 +147,64 @@ def extract_publish_time(html: str, soup: BeautifulSoup) -> str:
     return ""
 
 
-def parse_page(url: str) -> dict[str, str]:
+def extract_picture_message(soup: BeautifulSoup) -> dict[str, str]:
+    """图片消息正文由脚本渲染；只读已知字段，不执行网页 JavaScript。"""
+    if not soup.select_one("#js_article.share_content_page"):
+        return {}
+    scripts = [node.get_text() for node in soup.find_all("script")
+               if re.search(r"window\.cgiDataNew\s*=\s*\{", node.get_text())]
+    if len(scripts) != 1 or not re.search(r"\bitem_show_type:\s*'8'", scripts[0]):
+        return {}
+    def field(name: str) -> str:
+        matches = re.findall(r"\b" + re.escape(name) + r"\s*:\s*'((?:\\.|[^'\\])*)'", scripts[0])
+        if len(matches) != 1:
+            return ""  # 多个来源时不猜测，防止把引用文章当成当前文章。
+        value = re.sub(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[nrt'\"\\])",
+                       lambda m: chr(int(m[1][1:], 16)) if m[1][0] in "xu"
+                       else {"n": "\n", "r": "\r", "t": "\t"}.get(m[1], m[1]), matches[0])
+        return html.unescape(value).strip()
+    title = soup.select_one('meta[property="og:title"]')
+    result = {"title": title.get("content", "").strip() if title else "",
+              "content": field("content_noencode"), "account_name": field("nick_name"),
+              "publish_time": field("create_time")}
+    return result if all(result.values()) else {}
+
+
+def parse_page(url: str, *, include_network_identity: bool = False) -> dict[str, str]:
     response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
     response.raise_for_status()
     # 微信页面实际使用 UTF-8，但响应头有时缺少 charset，requests 会误判为 ISO-8859-1。
     response.encoding = "utf-8"
-    soup = BeautifulSoup(response.text, "html.parser")
+    page = parse_page_html(response.text)
+    # 保留重定向后的地址用于抓包关联，不将临时认证参数写入业务记录。
+    if include_network_identity:
+        from network_metrics import page_article_identity
+        resolved = response.url if isinstance(getattr(response, "url", None), str) else url
+        page["network_article_id"] = page_article_identity(resolved, response.text) or ""
+    return page
+
+
+def parse_page_html(document: str) -> dict[str, str]:
+    """解析已取得的响应正文，供 HTTP 下载和本机抓包共用。"""
+    soup = BeautifulSoup(document, "html.parser")
     title_node = soup.select_one("#activity-name")
     content_node = soup.select_one("#js_content")
     account_node = soup.select_one("#js_name") or soup.select_one(".profile_nickname")
     title = clean_text(title_node)
     content = clean_text(content_node)
-    publish_time = extract_publish_time(response.text, soup)
+    publish_time = extract_publish_time(document, soup)
 
     # 页面脚本通常保留公众号昵称，作为 DOM 缺失时的后备来源。
     account_name = clean_text(account_node)
     if not account_name:
-        match = re.search(r'var\s+nickname\s*=\s*htmlDecode\("(.*?)"\)', response.text)
+        match = re.search(r'var\s+nickname\s*=\s*htmlDecode\("(.*?)"\)', document)
         account_name = match.group(1) if match else ""
+
+    if not title or not content:
+        picture = extract_picture_message(soup)
+        if picture:
+            title, content = picture["title"], picture["content"]
+            account_name, publish_time = picture["account_name"], picture["publish_time"]
 
     if not title:
         raise ValueError("文章页面没有标题")

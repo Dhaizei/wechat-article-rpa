@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -27,11 +28,13 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 from uuid import uuid4
 
+import requests
 from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
 from env_config import load_project_env
+from runtime_diagnostics import runtime_identity
 
 
 # 必须在读取 MongoDB、管理员密码等模块级配置前加载本机 .env。
@@ -59,6 +62,7 @@ BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 # 可通过环境变量覆盖默认凭据，便于部署时接入自己的密钥管理方式。
 CONTROL_PANEL_USERNAME = os.getenv("CONTROL_PANEL_USERNAME", "admin")
 CONTROL_PANEL_PASSWORD = os.getenv("CONTROL_PANEL_PASSWORD", "admin-123")
+CONTROL_PANEL_HOST = os.getenv("CONTROL_PANEL_HOST", "0.0.0.0")
 PUBLIC_TEAM_PATHS = frozenset(
     {
         "/briefing.html",
@@ -95,6 +99,9 @@ TERMINAL_WARNING_EVENTS = frozenset(
         "article_tab_cleanup_failed",
     }
 )
+LOW_ARTICLE_ALERT_THRESHOLD = max(
+    1, int(os.getenv("FEISHU_LOW_ARTICLE_THRESHOLD", "10"))
+)
 
 # 采集器只传递稳定的错误分类；控制台在此转换为用户可以立即执行的恢复步骤。
 # 该映射同时写入任务历史，避免日后分类文案调整导致旧任务无法解释。
@@ -103,6 +110,10 @@ FAILURE_RECOVERY_HINTS = {
     "account_not_found": "确认公众号当前名称；如名称已变更，请更新账号别名后重试。",
     "profile_validation": "关闭残留的公众号资料页，确认搜索结果名称后重试。",
     "interaction_ocr": "确认微信缩放和页面完整显示，再重试补采互动数据。",
+    "search_recovery": "未恢复搜一搜入口，请检查浏览器标签和失败截图后重试。",
+    "navigation_return": "返回路径未确认，异常页面已保留，请检查导航日志后补采。",
+    "article_identity": "文章身份未确认，请检查页面证据中的标题和公众号。",
+    "card_identity": "列表卡片身份不明确，请检查标题提取结果并补采失败文章。",
     "copy_link": "确认文章页已完全加载且微信可访问剪贴板后重试。",
     "window": "将微信“搜一搜”窗口置前并保持可见后重试。",
     "network": "检查网络连接和微信页面加载状态后重试。",
@@ -1170,6 +1181,38 @@ class RunHistory:
         return None
 
 
+def _window_process_name(hwnd: int) -> str:
+    """读取窗口所属进程名；失败时返回空字符串供预检保守处理。"""
+    if os.name != "nt":
+        return ""
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    process_id = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+    if not process_id.value:
+        return ""
+    handle = kernel32.OpenProcess(0x1000, False, process_id.value)
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        executable = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(
+            handle, 0, executable, ctypes.byref(size)
+        ):
+            return ""
+        return Path(executable.value).name.lower()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _visible_windows() -> list[dict[str, str]]:
     """读取可见窗口的最小信息，仅用于启动前检查，不采集窗口内容。"""
     if os.name != "nt":
@@ -1189,7 +1232,14 @@ def _visible_windows() -> list[dict[str, str]]:
         class_buffer = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
         user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
-        windows.append({"title": title_buffer.value.strip(), "class_name": class_buffer.value})
+        windows.append(
+            {
+                "hwnd": str(hwnd),
+                "title": title_buffer.value.strip(),
+                "class_name": class_buffer.value,
+                "process_name": _window_process_name(hwnd),
+            }
+        )
         return True
 
     user32.EnumWindows(enumerate_window, 0)
@@ -1236,37 +1286,72 @@ def collect_desktop_environment() -> dict[str, Any]:
     }
 
 
+LEGACY_SEARCH_CHECK_LOCK = threading.Lock()
+LEGACY_SEARCH_CHECK_CACHE: dict[str, Any] = {}
+
+
+def _legacy_search_ready(windows: list[dict[str, str]]) -> bool:
+    """复用采集端页面验证；短缓存避免网页轮询重复并发运行 OCR。"""
+    candidates = tuple(
+        (item.get("hwnd", ""), item.get("process_name", ""))
+        for item in windows
+        if item["title"] == "微信"
+        and item["class_name"].startswith("Chrome_WidgetWin")
+        and item.get("process_name") in {"wechatappex.exe", "wechatbrowser.exe", "weixinappex.exe"}
+    )
+    if not candidates:
+        return False
+    with LEGACY_SEARCH_CHECK_LOCK:
+        if (LEGACY_SEARCH_CHECK_CACHE.get("candidates") == candidates
+                and time.monotonic() < LEGACY_SEARCH_CHECK_CACHE.get("expires", 0)):
+            return bool(LEGACY_SEARCH_CHECK_CACHE["ready"])
+        try:
+            from wechat_visual_rpa import find_navigation_browser
+
+            ready = bool(find_navigation_browser())
+        except Exception:  # OCR 不可用时保持未就绪，不能阻断整个预检接口。
+            ready = False
+        LEGACY_SEARCH_CHECK_CACHE.update(
+            candidates=candidates, ready=ready, expires=time.monotonic() + 15
+        )
+        return ready
+
+
 def collect_preflight() -> dict[str, Any]:
-    """检查运行前必需的微信主窗口和搜一搜窗口，避免任务盲目启动。"""
+    """检查搜一搜窗口；微信主窗口仅用于自动恢复，不作为启动门槛。"""
     windows = _visible_windows()
     main_windows = [
         item
         for item in windows
-        if item["title"] == "微信" and item["class_name"].startswith("Qt")
+        if item["title"] == "微信"
+        and item["class_name"].startswith(("Qt", "Chrome_WidgetWin"))
+        and item.get("process_name", "") in {"wechat.exe", "weixin.exe"}
     ]
     search_windows = [
         item
         for item in windows
         if item["class_name"].startswith("Chrome_WidgetWin")
-        and (item["title"] == "微信" or "搜一搜" in item["title"])
+        # 标题明确的窗口走快速检查，旧版“微信”标题再做页面级复核。
+        and "搜一搜" in item["title"]
     ]
     wechat_ok = bool(main_windows)
-    search_ok = bool(search_windows)
+    search_ok = bool(search_windows) or _legacy_search_ready(windows)
     desktop = collect_desktop_environment()
     return {
         "checked_at": datetime.now().isoformat(timespec="seconds"),
-        "ready": wechat_ok and search_ok,
+        # 搜一搜本身已经打开时，即使微信主窗口因版本差异未被识别，也可以正常采集。
+        "ready": search_ok,
         "wechat": {
             "ok": wechat_ok,
             "message": "已检测到微信主窗口" if wechat_ok else "未检测到微信主窗口：请启动微信并完成登录",
         },
         "search": {
             "ok": search_ok,
-            "message": "已检测到“搜一搜”窗口" if search_ok else "未检测到“搜一搜”窗口：请在微信内搜索并打开它",
+            "message": "已检测到微信采集页面，完整导航链路将在采集时验证" if search_ok else "未识别到微信采集页面：请打开搜一搜或公众号主页",
         },
         "automation": {
             "ok": True,
-            "message": "公众号资料与文章窗口会在采集时自动打开和关闭",
+            "message": "采集时验证页面身份与返回路径，兼容同窗标签和独立窗口",
         },
         "desktop": desktop,
     }
@@ -1275,7 +1360,7 @@ def collect_preflight() -> dict[str, Any]:
 PREFLIGHT_RECOVERY_LOCK = threading.Lock()
 
 
-def recover_sogou_preflight() -> dict[str, Any]:
+def recover_sogou_preflight(*, running: bool | None = None) -> dict[str, Any]:
     """在用户主动点击重新检测时，尝试从微信主窗口恢复“搜一搜”。"""
     before = collect_preflight()
     recovery = {
@@ -1285,11 +1370,9 @@ def recover_sogou_preflight() -> dict[str, Any]:
     }
     if before["search"]["ok"]:
         return {**before, "recovery": recovery}
-    if STATE.running():
+    is_running = STATE.running() if running is None else running
+    if is_running:
         recovery["message"] = "当前正在采集，为避免抢占微信窗口，暂不自动打开“搜一搜”。"
-        return {**before, "recovery": recovery}
-    if not before["wechat"]["ok"]:
-        recovery["message"] = "未检测到已登录的微信主窗口，无法自动打开“搜一搜”。"
         return {**before, "recovery": recovery}
     if not PREFLIGHT_RECOVERY_LOCK.acquire(blocking=False):
         recovery["message"] = "正在尝试打开“搜一搜”，请稍候再检查。"
@@ -1297,13 +1380,23 @@ def recover_sogou_preflight() -> dict[str, Any]:
 
     try:
         # 复用正式采集流程的恢复逻辑，避免控制台和采集端使用两套点击规则。
-        from wechat_visual_rpa import open_sogou_from_wechat_main
+        from wechat_visual_rpa import find_sogou_search_window, open_sogou_from_wechat_main
 
         STATE.add_log("info", "未检测到“搜一搜”窗口，正在从微信主窗口自动打开。")
-        opened = open_sogou_from_wechat_main("控制台预检")
+        try:
+            # 旧版窗口标题可能只有“微信”，先用页面内容复核，避免重复打开。
+            opened = find_sogou_search_window()
+        except RuntimeError:
+            opened = open_sogou_from_wechat_main("控制台预检")
         time.sleep(0.8)
         after = collect_preflight()
-        recovered = bool(after["search"]["ok"])
+        recovered = bool(after["search"]["ok"] or opened)
+        if recovered and not after["search"]["ok"]:
+            after["ready"] = True
+            after["search"] = {
+                "ok": True,
+                "message": "已通过页面内容复核旧版“搜一搜”窗口",
+            }
         message = "已自动打开“搜一搜”窗口并完成复检。" if recovered else "已提交打开“搜一搜”的操作，但窗口尚未被检测到。"
         STATE.add_log("success" if recovered else "warning", message)
         return {
@@ -1313,6 +1406,7 @@ def recover_sogou_preflight() -> dict[str, Any]:
                 "succeeded": recovered,
                 "message": message,
                 "window_handle": opened.hwnd,
+                "method": "ctrl-f-local-ocr-qwen-vl",
             },
         }
     except Exception as exc:  # noqa: BLE001
@@ -1367,15 +1461,23 @@ def format_process_event_message(payload: dict[str, Any]) -> str | None:
     """
     event = _event_text(payload.get("event"), "")
     account = _event_text(payload.get("account"), "未命名公众号")
+    if event == "batch_navigation_blocked":
+        return f"浏览器未恢复，已停止本轮并保存结果：{_event_text(payload.get('error'))}。"
+    if event == "batch_navigation_recovered":
+        return f"{account}失败后已找回搜一搜，继续处理后续公众号。"
     if event == "accounts_loaded":
         return f"已加载 {_event_count(payload.get('count'))} 个公众号。"
     if event == "account_collection_started":
         return f"开始采集公众号：{account}（每账号最多 {_event_count(payload.get('max_articles'))} 篇）。"
     if event == "account_collection_finished":
         detected = _event_count(payload.get("detected_articles"))
+        collected = len(payload.get("collected") or [])
+        failures = payload.get("failures") or []
+        if failures:
+            return f"公众号采集不完整：{account}，成功 {collected} 篇，失败 {len(failures)} 篇，请补采。"
         scan = payload.get("scan") if isinstance(payload.get("scan"), dict) else {}
-        if detected:
-            return f"公众号采集完成：{account}，识别到 {detected} 篇文章。"
+        if collected:
+            return f"公众号采集完成：{account}，成功 {collected} 篇，识别到 {detected} 篇不同文章。"
         return (
             f"公众号无更新：{account}；已检查 {_event_count(scan.get('observed_cards'))} 张卡片，"
             f"范围外 {_event_count(scan.get('outside_range_cards'))} 张；"
@@ -1402,7 +1504,7 @@ def format_process_event_message(payload: dict[str, Any]) -> str | None:
     if event == "article_metrics_partial":
         return "文章互动指标待补齐：已保留可识别的指标，后续可重试补采。"
     if event == "article_title_evidence_warning":
-        return f"文章标题证据待复核：{_event_text(payload.get('title'), '未识别标题')}。"
+        return f"文章标题证据待复核：{_event_text(payload.get('parsed_title') or payload.get('title'), '未识别标题')}。"
     return None
 
 
@@ -1421,11 +1523,179 @@ def determine_final_run_status(
     successful_accounts = int(summary.get("accounts_succeeded") or 0) + int(
         summary.get("accounts_no_updates") or 0
     )
-    if failed_accounts and not successful_accounts:
+    if failed_accounts and not successful_accounts and not int(summary.get("articles_collected") or 0):
         return "failed", "任务执行结束，但全部公众号采集失败"
     if failed_accounts:
         return "partial", "任务执行结束，部分公众号采集失败"
     return "completed", "任务执行完成"
+
+
+def should_send_low_article_alert(
+    *, status: str, summary: dict[str, Any], threshold: int = LOW_ARTICLE_ALERT_THRESHOLD
+) -> bool:
+    """判断自然结束的任务是否需要发送抓取数量预警。"""
+    if status == "cancelled":
+        return False
+    return int(summary.get("articles_collected") or 0) <= threshold
+
+
+def _send_feishu_card(*, title: str, content: str, template: str) -> bool:
+    """发送通用飞书卡片；未配置机器人时安静跳过。"""
+    # 飞书控制台复制出的地址偶尔会带末尾斜杠，发送前统一规范化。
+    webhook_url = os.getenv("FEISHU_WEBHOOK", "").strip().rstrip("/")
+    if not webhook_url:
+        return False
+    payload: dict[str, Any] = {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True, "enable_forward": True},
+            "header": {
+                "template": template,
+                "title": {"tag": "plain_text", "content": title},
+            },
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+            ],
+        },
+    }
+    webhook_secret = os.getenv("FEISHU_WEBHOOK_SECRET", "").strip()
+    if webhook_secret:
+        timestamp = str(int(time.time()))
+        string_to_sign = f"{timestamp}\n{webhook_secret}"
+        payload["timestamp"] = timestamp
+        payload["sign"] = base64.b64encode(
+            hmac.new(string_to_sign.encode("utf-8"), digestmod="sha256").digest()
+        ).decode("utf-8")
+
+    response = requests.post(webhook_url, json=payload, timeout=15)
+    response.raise_for_status()
+    result = response.json()
+    if result.get("code", result.get("StatusCode", 0)) != 0:
+        raise RuntimeError(f"飞书返回发送失败：{result}")
+    return True
+
+
+def send_run_started_feishu_notification(
+    *, run_id: str, source: str, parameters: dict[str, Any], started_at: str
+) -> bool:
+    """发送抓取开始通知。"""
+    scan_range = str(parameters.get("scan_range") or "")
+    range_text = scan_range_label(scan_range) if scan_range in SCAN_RANGE_VALUES else "未记录"
+    source_text = "手动任务" if source == "manual" else "定时任务"
+    content = (
+        "**微信公众号文章抓取任务已开始。**\n\n"
+        f"- 任务类型：{source_text}\n"
+        f"- 抓取范围：{range_text}\n"
+        f"- 每账号上限：{parameters.get('max_articles', '未记录')} 篇\n"
+        f"- 开始时间：{started_at}\n"
+        f"- 任务 ID：{run_id}"
+    )
+    return _send_feishu_card(title="文章抓取任务开始", content=content, template="blue")
+
+
+def send_run_blocked_feishu_notification(
+    *,
+    run_id: str,
+    source: str,
+    parameters: dict[str, Any],
+    preflight: dict[str, Any],
+    blocked_at: str,
+) -> bool:
+    """启动前自动恢复仍失败时发送一次红色飞书告警。"""
+    source_text = "手动任务" if source == "manual" else "定时任务"
+    scan_range = str(parameters.get("scan_range") or "")
+    range_text = scan_range_label(scan_range) if scan_range in SCAN_RANGE_VALUES else "未记录"
+    recovery = dict(preflight.get("recovery") or {})
+    search = dict(preflight.get("search") or {})
+    wechat = dict(preflight.get("wechat") or {})
+    reason = str(recovery.get("message") or search.get("message") or "未检测到搜一搜窗口")
+    content = (
+        "**抓取任务未能启动：自动恢复“搜一搜”失败。**\n\n"
+        f"- 任务类型：{source_text}\n"
+        f"- 抓取范围：{range_text}\n"
+        f"- 微信主窗口：{wechat.get('message', '未记录')}\n"
+        f"- 自动恢复：{reason}\n"
+        f"- 时间：{blocked_at}\n"
+        f"- 任务 ID：{run_id}\n\n"
+        "请确认微信已经登录且主窗口可见，再从控制台重新执行。"
+    )
+    return _send_feishu_card(title="抓取任务启动失败", content=content, template="red")
+
+
+def send_run_finished_feishu_notification(
+    *, run_id: str, status: str, summary: dict[str, Any], parameters: dict[str, Any], finished_at: str
+) -> bool:
+    """发送抓取结束通知，包含成功、失败和手动停止场景。"""
+    status_text = {
+        "completed": "已完成",
+        "partial": "部分失败",
+        "failed": "执行失败",
+        "cancelled": "已手动停止",
+    }.get(status, status)
+    template = {
+        "completed": "green",
+        "partial": "orange",
+        "failed": "red",
+        "cancelled": "grey",
+    }.get(status, "grey")
+    scan_range = str(parameters.get("scan_range") or "")
+    range_text = scan_range_label(scan_range) if scan_range in SCAN_RANGE_VALUES else "未记录"
+    content = (
+        f"**微信公众号文章抓取任务{status_text}。**\n\n"
+        f"- 成功抓取文章：{int(summary.get('articles_collected') or 0)} 篇\n"
+        f"- 完成公众号：{int(summary.get('accounts_finished') or 0)}/"
+        f"{int(summary.get('total_accounts') or 0)}\n"
+        f"- 失败公众号：{int(summary.get('accounts_failed') or 0)}\n"
+        f"- 抓取范围：{range_text}\n"
+        f"- 结束时间：{finished_at}\n"
+        f"- 任务 ID：{run_id}"
+    )
+    return _send_feishu_card(title="文章抓取任务结束", content=content, template=template)
+
+
+def send_low_article_feishu_alert(
+    *,
+    run_id: str,
+    status: str,
+    summary: dict[str, Any],
+    parameters: dict[str, Any],
+    finished_at: str,
+    threshold: int = LOW_ARTICLE_ALERT_THRESHOLD,
+) -> bool:
+    """发送飞书抓取结果预警；未配置 webhook 时安静跳过。"""
+
+    article_count = int(summary.get("articles_collected") or 0)
+    failed_accounts = int(summary.get("accounts_failed") or 0)
+    finished_accounts = int(summary.get("accounts_finished") or 0)
+    total_accounts = int(summary.get("total_accounts") or 0)
+    scan_range = str(parameters.get("scan_range") or "")
+    range_text = (
+        scan_range_label(scan_range) if scan_range in SCAN_RANGE_VALUES else "未记录"
+    )
+    status_text = {
+        "completed": "已完成",
+        "partial": "部分失败",
+        "failed": "执行失败",
+    }.get(status, status)
+    diagnosis = (
+        "本次任务同时存在执行异常，请优先检查失败账号和任务日志。"
+        if status in {"partial", "failed"}
+        else "可能是正常的低发文量，也可能存在页面、网络或采集流程异常。"
+    )
+    content = (
+        f"**本次仅成功抓取 {article_count} 篇文章，已达到或低于预警阈值 {threshold} 篇。**\n\n"
+        f"{diagnosis}\n\n"
+        f"- 任务状态：{status_text}\n"
+        f"- 抓取范围：{range_text}\n"
+        f"- 完成公众号：{finished_accounts}/{total_accounts}\n"
+        f"- 失败公众号：{failed_accounts}\n"
+        f"- 完成时间：{finished_at}\n"
+        f"- 任务 ID：{run_id}\n\n"
+        "请检查本次任务日志及失败账号，确认是否需要重新执行。"
+    )
+    return _send_feishu_card(
+        title="文章抓取数量异常预警", content=content, template="orange"
+    )
 
 
 class ControlState:
@@ -1462,6 +1732,7 @@ class ControlState:
             "current_account_index": 0,
             "current_account_articles": 0,
             "articles_collected": 0,
+            "articles_failed": 0,
             "accounts_succeeded": 0,
             "accounts_no_updates": 0,
             "accounts_failed": 0,
@@ -1484,6 +1755,15 @@ class ControlState:
         """将 RPA 的 JSON 日志事件汇总成适合控制台展示的进度数据。"""
         event = str(payload.get("event") or "")
         progress = self.progress
+        # 正常返回函数不等于所有文章成功：将携带失败明细的结束事件计入失败账号。
+        if event == "account_collection_finished" and payload.get("failures"):
+            failures = payload["failures"]
+            progress["articles_failed"] = progress.get("articles_failed", 0) + len(failures)
+            payload = {**payload, "event": "account_collection_failed",
+                       "error": f"成功 {len(payload.get('collected') or [])} 篇，失败 {len(failures)} 篇；"
+                                + str(failures[0].get("error") or "文章采集失败"),
+                       "category": failures[0].get("category") or "unknown"}
+            event = "account_collection_failed"
         if event == "accounts_loaded":
             progress["total_accounts"] = max(0, int(payload.get("count") or 0))
             progress["phase"] = "账号列表已加载"
@@ -1503,7 +1783,7 @@ class ControlState:
         elif event in {"account_collection_finished", "account_collection_failed"}:
             progress["accounts_finished"] += 1
             if event == "account_collection_finished":
-                if int(payload.get("detected_articles") or 0) > 0:
+                if payload.get("collected"):
                     progress["accounts_succeeded"] += 1
                 else:
                     progress["accounts_no_updates"] += 1
@@ -1650,6 +1930,7 @@ class ControlState:
             "accounts_no_updates": int(progress.get("accounts_no_updates") or 0),
             "accounts_failed": int(progress.get("accounts_failed") or 0),
             "articles_collected": int(progress.get("articles_collected") or 0),
+            "articles_failed": int(progress.get("articles_failed") or 0),
             "articles_inserted": int(progress.get("articles_inserted") or 0),
             "articles_updated": int(progress.get("articles_updated") or 0),
             "articles_unchanged": int(progress.get("articles_unchanged") or 0),
@@ -1729,12 +2010,16 @@ class ControlState:
                 "metrics": selected_metrics,
             }
             preflight = collect_preflight()
+            if not preflight["ready"]:
+                # 手动任务和定时任务使用同一套自动恢复，不再要求用户先点预检按钮。
+                preflight = recover_sogou_preflight(running=False)
             run_id = uuid4().hex
             if not preflight["ready"]:
-                message = "启动前检查未通过：" + "；".join(
-                    item["message"]
-                    for item in (preflight["wechat"], preflight["search"])
-                    if not item["ok"]
+                recovery_message = str(
+                    (preflight.get("recovery") or {}).get("message") or ""
+                )
+                message = "启动前检查未通过：" + (
+                    recovery_message or str(preflight["search"]["message"])
                 )
                 self._create_run_record(
                     run_id=run_id,
@@ -1747,6 +2032,18 @@ class ControlState:
                 self.latest_event = "任务未启动：前置条件不足"
                 self.last_run_options = options
                 self.add_log("warning", message)
+                try:
+                    if send_run_blocked_feishu_notification(
+                        run_id=run_id,
+                        source=source,
+                        parameters=options,
+                        preflight=preflight,
+                        blocked_at=datetime.now().isoformat(timespec="seconds"),
+                    ):
+                        self.add_log("info", "已发送飞书抓取启动失败告警。")
+                except (requests.RequestException, RuntimeError, ValueError) as exc:
+                    # 告警失败不能掩盖真实的启动阻塞原因。
+                    self.add_log("error", f"飞书抓取启动失败告警发送失败：{exc}")
                 return False, message
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             output_dir = RPA_DIR / "output" / f"mongo-{stamp}"
@@ -1799,6 +2096,17 @@ class ControlState:
             f"指标={metrics_label(selected_metrics)}，每账号最多 {count} 篇。",
         )
         threading.Thread(target=self._read_process, args=(process, run_id), daemon=True).start()
+        try:
+            if send_run_started_feishu_notification(
+                run_id=run_id,
+                source=source,
+                parameters=options,
+                started_at=self.started_at,
+            ):
+                self.add_log("info", "已发送飞书抓取开始通知。")
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            # 通知属于旁路能力，发送失败不能中断已经启动的采集任务。
+            self.add_log("error", f"飞书抓取开始通知发送失败：{exc}")
         return True, "任务已启动"
 
     def _read_process(self, process: subprocess.Popen[str], run_id: str) -> None:
@@ -1871,6 +2179,20 @@ class ControlState:
                     exit_code=exit_code,
                     result_message=final_event,
                 )
+        record = self.history.get(run_id) or {}
+        try:
+            if send_run_finished_feishu_notification(
+                run_id=run_id,
+                status=final_status,
+                summary=final_summary,
+                parameters=dict(record.get("parameters") or {}),
+                finished_at=finished_at,
+            ):
+                self.add_log("info", "已发送飞书抓取结束通知。")
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            # 结束通知失败也不能覆盖采集任务的真实状态。
+            self.add_log("error", f"飞书抓取结束通知发送失败：{exc}")
+
         if manually_stopped:
             self.add_log("warning", f"采集任务已手动停止，返回码：{exit_code}。")
             return
@@ -1882,6 +2204,30 @@ class ControlState:
             self.add_log("error", "采集任务已结束，但全部公众号采集失败，请先恢复微信和搜一搜窗口。")
         else:
             self.add_log("error", f"采集任务退出，返回码：{exit_code}。")
+
+        if should_send_low_article_alert(status=final_status, summary=final_summary):
+            try:
+                sent = send_low_article_feishu_alert(
+                    run_id=run_id,
+                    status=final_status,
+                    summary=final_summary,
+                    parameters=dict(record.get("parameters") or {}),
+                    finished_at=finished_at,
+                )
+                if sent:
+                    self.add_log(
+                        "warning",
+                        f"本次抓取文章不超过 {LOW_ARTICLE_ALERT_THRESHOLD} 篇，已发送飞书预警。",
+                    )
+                else:
+                    self.add_log(
+                        "warning",
+                        f"本次抓取文章不超过 {LOW_ARTICLE_ALERT_THRESHOLD} 篇，"
+                        "但未配置 FEISHU_WEBHOOK，已跳过通知。",
+                    )
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                # 通知属于旁路能力，发送失败不能覆盖真实的采集任务结果。
+                self.add_log("error", f"飞书抓取数量预警发送失败：{exc}")
 
     def stop_job(self) -> tuple[bool, str]:
         with self.lock:
@@ -2147,7 +2493,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     raise ValueError("导出格式仅支持 csv 或 json")
             except PyMongoError as exc:
                 # 数据库连接/认证异常也必须返回 JSON，前端才能展示可处理的原因。
-                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"导出公众号失败：{exc}"}, HTTPStatus.BAD_REQUEST)
             return
@@ -2163,7 +2509,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 )
                 self._json({"ok": True, **result})
             except PyMongoError as exc:
-                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取公众号失败：{exc}"}, HTTPStatus.BAD_REQUEST)
             return
@@ -2178,7 +2524,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 )
                 self._json({"ok": True, **result})
             except PyMongoError as exc:
-                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取日报失败：{exc}"}, HTTPStatus.BAD_REQUEST)
             return
@@ -2188,7 +2534,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 issue_date = str(query.get("date", [beijing_today().isoformat()])[0])
                 self._json({"ok": True, **daily_briefing(issue_date=issue_date)})
             except PyMongoError as exc:
-                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取每日新闻失败：{exc}"}, HTTPStatus.BAD_REQUEST)
             return
@@ -2210,7 +2556,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 )
                 self._json({"ok": True, **result})
             except PyMongoError as exc:
-                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取文章失败：{exc}"}, HTTPStatus.BAD_REQUEST)
             return
@@ -2237,7 +2583,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 else:
                     raise ValueError("导出格式仅支持 csv 或 json")
             except PyMongoError as exc:
-                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"导出文章失败：{exc}"}, HTTPStatus.BAD_REQUEST)
             return
@@ -2250,7 +2596,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                 else:
                     self._json({"ok": True, "item": item})
             except PyMongoError as exc:
-                self._json({"ok": False, "message": f"MongoDB 暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取文章详情失败：{exc}"}, HTTPStatus.BAD_REQUEST)
             return
@@ -2372,20 +2718,42 @@ class ControlHandler(SimpleHTTPRequestHandler):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=CONTROL_PANEL_HOST)
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--no-browser", action="store_true")
     return parser.parse_args()
 
 
+def browser_url_for_listener(host: str, port: int) -> str:
+    """把监听地址转换为本机浏览器真正可访问的地址。"""
+    browser_host = "127.0.0.1" if host in {"0.0.0.0", "::", "[::]"} else host
+    return f"http://{browser_host}:{port}/"
+
+
+class ExclusiveControlServer(ThreadingHTTPServer):
+    """Windows 禁止多个控制台复用端口，防止旧实例继续调度采集。"""
+
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def main() -> None:
     args = parse_args()
+    # 必须先取得监听端口，失败的重复实例不能启动后台调度线程。
+    server = ExclusiveControlServer((args.host, args.port), ControlHandler)
+    STATE.add_log("info", json.dumps({"event": "control_panel_runtime_identity",
+                                    **runtime_identity(__file__)}, ensure_ascii=False))
     threading.Thread(target=scheduler_loop, daemon=True).start()
-    server = ThreadingHTTPServer((args.host, args.port), ControlHandler)
-    url = f"http://{args.host}:{args.port}/"
-    print(f"公众号采集控制台已启动：{url}")
+    listen_url = f"http://{args.host}:{args.port}/"
+    browser_url = browser_url_for_listener(args.host, args.port)
+    print(f"公众号采集控制台已启动，监听地址：{listen_url}")
+    print(f"本机访问地址：{browser_url}")
     if not args.no_browser:
-        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.8, lambda: webbrowser.open(browser_url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

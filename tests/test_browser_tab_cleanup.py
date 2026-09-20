@@ -37,6 +37,7 @@ class BrowserTabCleanupTests(unittest.TestCase):
             patch.object(rpa, "arrange_automation_window", return_value=recovered),
             patch.object(rpa, "activate_window"),
             patch.object(rpa, "press_ctrl_1"),
+            patch.object(rpa, "browser_navigator") as navigator,
             patch.object(rpa.time, "sleep"),
             patch.object(rpa, "log_event"),
         ):
@@ -44,7 +45,8 @@ class BrowserTabCleanupTests(unittest.TestCase):
 
         self.assertEqual(result.hwnd, recovered.hwnd)
         close_window.assert_not_called()
-        open_search.assert_called_once_with("测试公众号", excluded_hwnds={stale.hwnd})
+        open_search.assert_called_once_with("测试公众号")
+        navigator.return_value.select.assert_called_once()
 
     def test_cleanup_recreates_search_window_when_search_tab_is_missing(self) -> None:
         """旧窗口找不到搜一搜标签时，应重建干净窗口而不是终止整个账号。"""

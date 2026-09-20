@@ -29,7 +29,6 @@ const elements = {
   clearLogs: document.querySelector("#clearLogs"),
   refreshPreflight: document.querySelector("#refreshPreflight"),
   preflightSummary: document.querySelector("#preflightSummary"),
-  wechatCheck: document.querySelector("#wechatCheck"),
   searchCheck: document.querySelector("#searchCheck"),
   desktopCheck: document.querySelector("#desktopCheck"),
   runSummaryText: document.querySelector("#runSummaryText"),
@@ -215,6 +214,7 @@ function runSummary(record = {}) {
   if (summary.article_tab_cleanup_warnings) parts.push(`标签清理待确认 ${summary.article_tab_cleanup_warnings}`);
   if (summary.accounts_no_updates) parts.push(`无更新 ${summary.accounts_no_updates} 个`);
   if (summary.accounts_failed) parts.push(`失败 ${summary.accounts_failed} 个`);
+  if (summary.articles_failed) parts.push(`文章失败 ${summary.articles_failed} 篇待补采`);
   return parts.join("，") || record.result_message || "暂无文章写入";
 }
 
@@ -232,7 +232,7 @@ function renderRunDiagnostic(record = null) {
   const preflight = record.preflight || {};
   const lines = [];
   if (record.status === "blocked") {
-    [preflight.wechat, preflight.search]
+    [preflight.search]
       .filter((item) => item && !item.ok)
       .forEach((item) => lines.push(`启动前检查：${item.message}`));
   }
@@ -361,12 +361,11 @@ async function loadPreflight({ notify = false, recover = false } = {}) {
       recover ? { method: "POST", body: "{}" } : {},
     );
     preflightReady = preflight.ready;
-    renderPreflightItem(elements.wechatCheck, preflight.wechat);
     renderPreflightItem(elements.searchCheck, preflight.search);
     elements.desktopCheck.innerHTML = `<strong>屏幕与缩放适配</strong>：${preflight.desktop.message}`;
     elements.preflightSummary.textContent = preflight.ready
-      ? "采集环境已就绪，可以开始采集。"
-      : "请先完成红色提示中的前置条件，再启动任务。";
+      ? "已识别微信页面；启动后将验证公众号与文章导航。"
+      : "请先在微信中打开搜一搜或公众号主页，再启动任务。";
     updateTaskButtons();
     if (notify) {
       const recoveryMessage = preflight.recovery?.message;
@@ -406,7 +405,7 @@ async function loadStatus() {
     const lastRunOptions = status.last_run_options || {};
     elements.currentDetail.textContent = status.running
       ? `当前任务：${optionText(lastRunOptions)}。采集期间请勿操作鼠标和键盘。`
-      : (lastRunOptions.scan_range ? `上次任务：${optionText(lastRunOptions)}。` : "确认微信已登录，并保持“搜一搜”窗口可见。");
+      : (lastRunOptions.scan_range ? `上次任务：${optionText(lastRunOptions)}。` : "请保持“搜一搜”窗口可见。");
     elements.progressBar.classList.toggle("running", status.running);
     elements.outputPath.textContent = status.output_dir || "尚未创建输出目录";
     elements.nextRun.textContent = status.next_run;
@@ -469,7 +468,7 @@ function openRunConfirm(source) {
   elements.confirmRunFacts.replaceChildren();
   [
     `参数来源：${sourceLabels[source] || source}`,
-    `账号来源：MongoDB 账号列表`,
+    `账号来源：公众号列表`,
     `扫描范围：${rangeLabels[options.scan_range]}`,
     `采集指标：${metricsLabels[options.metrics]}`,
     `每账号上限：${options.max_articles} 篇`,

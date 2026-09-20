@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from rapidocr_onnxruntime import RapidOCR
+from title_geometry import adjacent_title_lines
 
 
 def _normalize(value: str) -> str:
@@ -307,6 +308,33 @@ class WeChatProfileOCR:
             "button_y_1000": round(button["center_y"] * 1000 / height),
             "confidence": button["confidence"],
             "method": "rapidocr-sogou-search-box",
+        }
+
+    def locate_wechat_search_entry(self, screenshot: Image.Image) -> dict[str, Any]:
+        """定位微信主窗口搜索结果顶部的“搜索网络结果”入口。
+
+        微信 4.x 输入“搜一搜”并第一次回车后，真正打开搜一搜浏览器的
+        是顶部“搜索网络结果”整行；下方同名历史记录或聊天内容不能点击。
+        """
+        width, height = screenshot.size
+        candidates = [
+            row
+            for row in self._rows(screenshot)
+            if row["normalized"].startswith("搜索网络结果")
+            # 入口固定出现在左侧搜索框下方的顶部区域；避免误点聊天正文。
+            and row["center_x"] < width * 0.55
+            and height * 0.04 < row["center_y"] < height * 0.22
+        ]
+        if not candidates:
+            return {"found": False, "reason": "未识别到微信顶部的搜索网络结果入口"}
+        target = min(candidates, key=lambda row: row["center_y"])
+        return {
+            "found": True,
+            "text": target["text"],
+            "center_x_1000": round(target["center_x"] * 1000 / width),
+            "center_y_1000": round(target["center_y"] * 1000 / height),
+            "confidence": target["confidence"],
+            "method": "rapidocr-wechat-network-search-entry",
         }
 
     def locate_search_result(self, screenshot: Image.Image, expected_name: str) -> dict[str, Any]:
@@ -734,9 +762,7 @@ class WeChatProfileOCR:
             if not candidates:
                 continue
             nearest = max(candidates, key=lambda row: (row["bottom"], row["confidence"]))
-            group = [nearest]
-            # 只取最靠近指标的一行。卡片标题被截断时，后续标题校验支持可靠的
-            # 8 字以上前缀；向上盲目合并反而会吞入封面底部的表格或海报文字。
+            group = adjacent_title_lines(candidates, nearest)
             anchored_groups.append((group, metric))
 
         if anchored_groups:
